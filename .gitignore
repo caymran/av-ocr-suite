@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+*.log
+
+# PyInstaller / builds
+build/
+dist/
+*.spec
+
+# App runtime folders
+archives/
+logs/
+models_cache/
+models/base.en/
+models/*.bin
+models/*.onnx
+tesseract/
+ffmpeg/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
