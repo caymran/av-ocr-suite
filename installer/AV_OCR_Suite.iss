@@ -2,15 +2,19 @@
 ; Installs under %LOCALAPPDATA% and never asks for elevation.
 ; Save this file as UTF-8 WITH BOM to avoid garbled characters (—, ©).
 
+; at the very top of installer/AV_OCR_Suite.iss
+#ifndef SourceDir
+  #define SourceDir "dist\AV_OCR_Suite"
+#endif
+
 #define AppName        "AV + OCR Suite"
 #define AppVersion     "2.3.0"
 #define AppPublisher   "Caymran Cummings"
-#define AppURL         "https://caymran.com/av-ocr-suite"
+#define AppURL         "https://github.com/caymran/av-ocr-suite"
 ; Use a stable GUID for upgrades (generate once and keep it)
 #define AppId          "{{A6C7E7A5-8B5E-42E6-9D6E-7B5B9F3B1F0E}}"
 
 ; Where your built app lives (PyInstaller output)
-#define SourceDir      "C:\AIWorkspaces\LiveTranscriberDemo\dist\AV_OCR_Suite"
 
 [Setup]
 AppId={#AppId}
