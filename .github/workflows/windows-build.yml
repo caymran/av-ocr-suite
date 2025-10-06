@@ -33,21 +33,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # ---------- Cache & pre-download faster-whisper model ----------
-      - name: Cache faster-whisper model
-        id: cache-model
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.MODEL_DIR }}
-          key: ${{ env.MODEL_CACHE_KEY }}
-
-      - name: Pre-download model (base.en)
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
-
-
       # ---------- Build EXE ----------
       - name: PyInstaller build
         shell: pwsh
