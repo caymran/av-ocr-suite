@@ -47,8 +47,8 @@ jobs:
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: ${{ models/base.en }}
-          key: ${{ fasterwhisper-base-en-cache-v1 }}
+          path: models/base.en
+          key: fasterwhisper-base-en-cache-v1
 
       - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
