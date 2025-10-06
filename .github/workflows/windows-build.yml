@@ -42,17 +42,17 @@ jobs:
 
       - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: bash     # use bash heredoc (PowerShell breaks <<'PY')
+        shell: pwsh
         run: |
-          set -euo pipefail
-          mkdir -p models
-          python - <<'PY'
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          @"
 from pathlib import Path
-Path("models").mkdir(parents=True, exist_ok=True)
+Path('models').mkdir(parents=True, exist_ok=True)
 from faster_whisper import WhisperModel
-WhisperModel("base.en", device="cpu", compute_type="int8", download_root="models")
-print("Model downloaded to models/base.en")
-PY
+WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models')
+print('Model downloaded to models/base.en')
+"@ | Set-Content dl_model.py -Encoding UTF8
+          python dl_model.py
 
       # ---------- Ensure support files exist so spec doesn't fail ----------
       - name: Ensure support files exist
