@@ -25,23 +25,27 @@ jobs:
           pip install pyinstaller
 
       - name: Cache faster-whisper base.en
+        id: cache-model
         uses: actions/cache@v4
         with:
           path: models/base.en
           key: fasterwhisper-base-en-${{ runner.os }}-v1
 
       - name: Pre-download faster-whisper model (base.en)
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache-model.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          python - << 'PY'
-          from pathlib import Path
-          Path("models").mkdir(parents=True, exist_ok=True)
-          # Trigger a download into ./models using faster-whisper itself
-          from faster_whisper import WhisperModel
-          WhisperModel("base.en", device="cpu", compute_type="int8", download_root="models")
-          print("Model downloaded to models/base.en")
-          PY
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          $code = @'
+      from pathlib import Path
+      Path("models").mkdir(parents=True, exist_ok=True)
+      from faster_whisper import WhisperModel
+      WhisperModel("base.en", device="cpu", compute_type="int8", download_root="models")
+      print("Model downloaded to models/base.en")
+      '@
+          Set-Content -Path dl_model.py -Value $code -Encoding UTF8
+          python dl_model.py
+
 
       - name: Build EXE
         run: |
