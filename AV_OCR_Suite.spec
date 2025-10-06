@@ -27,10 +27,9 @@ except Exception:
     pass
 
 # ---------- App data ----------
-datas = [('custom_prompt.txt', '.')]
 
 # make sure the ico is included as data so Qt can load it at runtime too
-datas += [('av-ocr.ico', '.')]
+datas = [('av-ocr.ico', '.')]
 
 # put README in the dist root
 datas += [('README.txt', '.')]   
@@ -38,6 +37,10 @@ datas += [('README.txt', '.')]
 datas += [
     ('models/base.en/*', 'models/base.en'),
 ]
+
+# Only include custom_prompt.txt if it’s present in the repo
+if Path("custom_prompt.txt").exists():
+    datas.append(("custom_prompt.txt", ".", "."))  # (src, destdir, type)
 
 # ---------- Portable Tesseract (optional) ----------
 # Point this to your portable Tesseract root folder.
