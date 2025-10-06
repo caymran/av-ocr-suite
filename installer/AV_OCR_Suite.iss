@@ -90,6 +90,13 @@ Source: "{#RepoRoot}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; include model only if present
 Source: "{#SourceDir}\models\base.en\*"; DestDir: "{app}\models\base.en"; Flags: recursesubdirs createallsubdirs ignoreversion; Check: DirExists(ExpandConstant('{#SourceDir}\models\base.en'))
 
+
+; ffmpeg (optional)
+Source: "{#SourceDir}\ffmpeg\*"; DestDir: "{app}\ffmpeg"; Flags: recursesubdirs createallsubdirs ignoreversion; Check: DirExists(ExpandConstant('{#SourceDir}\ffmpeg'))
+
+; Tesseract + tessdata (optional)
+Source: "{#SourceDir}\tesseract\*"; DestDir: "{app}\tesseract"; Flags: recursesubdirs createallsubdirs ignoreversion; Check: DirExists(ExpandConstant('{#SourceDir}\tesseract'))
+
 [Icons]
 ; Start Menu shortcut
 Name: "{userprograms}\AV + OCR Suite\AV + OCR Suite"; Filename: "{app}\AV_OCR_Suite.exe"; WorkingDir: "{app}"; IconFilename: "{app}\av-ocr.ico"; IconIndex: 0
