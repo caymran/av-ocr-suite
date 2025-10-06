@@ -94,13 +94,13 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
-          if (-not (Test-Path "dist\AV_OCR_Suite\AV_OCR_Suite.exe")) {
-            Write-Error "PyInstaller output not found at dist\AV_OCR_Suite"; exit 1
+          $distAbs = (Resolve-Path "dist\AV_OCR_Suite").Path
+          if (-not (Test-Path "$distAbs\AV_OCR_Suite.exe")) {
+            Write-Error "PyInstaller output not found at $distAbs"; exit 1
           }
-          # /Qp = quiet-with-progress, /O sets Output dir, /DSourceDir overrides the define above
           iscc /Qp `
                "/OOutput" `
-               "/DSourceDir=dist\AV_OCR_Suite" `
+               "/DSourceDir=$distAbs" `
                installer\AV_OCR_Suite.iss
 
 
