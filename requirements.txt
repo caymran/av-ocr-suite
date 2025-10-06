@@ -7,5 +7,5 @@ Pillow==10.4.0
 pytesseract==0.3.10
 faster-whisper==1.0.0
 ctranslate2==4.3.1
-# Add anything else you use
+faster-whisper==1.0.3
 
