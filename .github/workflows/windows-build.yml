@@ -58,13 +58,16 @@ jobs:
           }
           Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
-      # move things into dist:
-      Copy-Item av-ocr.ico dist\AV_OCR_Suite\ -Force
-      Copy-Item README.txt dist\AV_OCR_Suite\ -Force
-      if (Test-Path models\base.en) {
-        New-Item -ItemType Directory -Force -Path dist\AV_OCR_Suite\models\base.en | Out-Null
-        Copy-Item models\base.en\* dist\AV_OCR_Suite\models\base.en\ -Recurse -Force
-      }
+      # ---------- Stage extras into dist (ICON, README, MODEL) ----------
+      - name: Stage extras into dist
+        shell: pwsh
+        run: |
+          if (Test-Path av-ocr.ico) { Copy-Item av-ocr.ico dist\AV_OCR_Suite\ -Force }
+          if (Test-Path README.txt) { Copy-Item README.txt dist\AV_OCR_Suite\ -Force }
+          if (Test-Path models\base.en) {
+            New-Item -ItemType Directory -Force -Path dist\AV_OCR_Suite\models\base.en | Out-Null
+            Copy-Item models\base.en\* dist\AV_OCR_Suite\models\base.en\ -Recurse -Force
+          }
 
 
       # ---------- (Optional) Sign the EXE if secrets provided ----------
