@@ -34,9 +34,10 @@ datas = [('av-ocr.ico', '.')]
 # put README in the dist root
 datas += [('README.txt', '.')]   
 
-datas += [
-    ('models/base.en/*', 'models/base.en'),
-]
+# Include Faster-Whisper model only if it's already present
+model_dir = Path("models") / "base.en"
+if model_dir.exists():
+    datas.append(Tree(str(model_dir), prefix="models/base.en"))
 
 # Only include custom_prompt.txt if it’s present in the repo
 if Path("custom_prompt.txt").exists():
