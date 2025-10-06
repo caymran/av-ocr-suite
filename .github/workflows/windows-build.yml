@@ -3,11 +3,11 @@ name: Windows Build
 on:
   push:
     tags:
-      - "v*.*.*"            # build & release when you push a semver tag
-  workflow_dispatch: {}     # manual trigger from the Actions tab
+      - "v*.*.*"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write           # needed for creating GitHub Releases
+  contents: write
 
 jobs:
   build:
@@ -17,7 +17,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          lfs: true         # harmless if you’re not using LFS yet
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,7 +25,7 @@ jobs:
           python-version: "3.9"
           cache: "pip"
 
-      - name: Install system deps (FFmpeg via Chocolatey)
+      - name: Install system deps (FFmpeg)
         shell: pwsh
         run: |
           choco install ffmpeg -y
@@ -37,83 +37,49 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # (Optional) Warm the faster-whisper base.en model cache during CI.
-      # Your app can also download at runtime; set to 'true' to prefetch.
-      - name: (Optional) Pre-fetch base.en model
-        if: ${{ false }}
-        env:
-          AVOS_WHISPER_MODEL: base.en
-        run: |
-          python - << "PY"
-          import os
-          from faster_whisper import WhisperModel
-          WhisperModel(os.getenv("AVOS_WHISPER_MODEL","base.en"),
-                       device="cpu", compute_type="int8")
-          print("Model fetched.")
-          PY
-
-      - name: Build EXE (PyInstaller)
+      - name: Build EXE
         run: |
           pyinstaller --clean -y AV_OCR_Suite.spec
           dir dist\AV_OCR_Suite
 
-      # (Optional) Code-sign the EXE if PFX secrets are provided
-      # Add repo secrets:
-      #   WINDOWS_CERT_BASE64  -> base64-encoded .pfx
-      #   WINDOWS_CERT_PASSWORD
-      #   SIGNING_TIMESTAMP_URL (e.g., http://timestamp.digicert.com)
       - name: Code sign EXE
-        if: ${{ secrets.WINDOWS_CERT_BASE64 && secrets.WINDOWS_CERT_PASSWORD && secrets.SIGNING_TIMESTAMP_URL }}
+        if: ${{ env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' && env.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
           $exe = (Get-ChildItem "dist\AV_OCR_Suite\*.exe" | Select-Object -First 1).FullName
-          if (-not $exe) { throw "EXE not found under dist\AV_OCR_Suite" }
-
-          # Locate signtool.exe from Windows SDK
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
                       Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
-                      Sort-Object FullName -Descending |
                       Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { throw "signtool.exe not found on runner" }
+          & "$signtool" sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /tr $env:SIGNING_TIMESTAMP_URL /td sha256 /fd sha256 "$exe"
 
-          & "$signtool" sign `
-            /f $pfxPath `
-            /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
-            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" `
-            /td sha256 /fd sha256 `
-            "$exe"
-
-      - name: Build Installer (Inno Setup)
+      - name: Build Installer
         uses: Minionguyjpro/Inno-Setup-Action@v1
         with:
           path: installer/AV_OCR_Suite.iss
 
-      # (Optional) Code-sign the installer too
       - name: Code sign Installer
-        if: ${{ secrets.WINDOWS_CERT_BASE64 && secrets.WINDOWS_CERT_PASSWORD && secrets.SIGNING_TIMESTAMP_URL }}
+        if: ${{ env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' && env.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
           if (-not (Test-Path $pfxPath)) {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
           }
           $setup = (Get-ChildItem "Output\*Setup*.exe" | Select-Object -First 1).FullName
-          if (-not $setup) { throw "Setup EXE not found under Output" }
-
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
                       Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
-                      Sort-Object FullName -Descending |
                       Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { throw "signtool.exe not found on runner" }
-
-          & "$signtool" sign `
-            /f $pfxPath `
-            /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
-            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" `
-            /td sha256 /fd sha256 `
-            "$setup"
+          & "$signtool" sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /tr $env:SIGNING_TIMESTAMP_URL /td sha256 /fd sha256 "$setup"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
