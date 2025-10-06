@@ -2,9 +2,12 @@
 ; Installs under %LOCALAPPDATA% and never asks for elevation.
 ; Save this file as UTF-8 WITH BOM to avoid garbled characters (—, ©).
 
-; at the very top of installer/AV_OCR_Suite.iss
+; Directory of the repository root (script is inside /installer)
+#define ScriptDir    GetEnv("CD")                     ; current working dir when CI calls ISCC (repo root)
+#define DistDir      AddBackslash(ScriptDir) + "dist\AV_OCR_Suite"
+
 #ifndef SourceDir
-  #define SourceDir "dist\AV_OCR_Suite"
+  #define SourceDir DistDir
 #endif
 
 #define AppName        "AV + OCR Suite"
