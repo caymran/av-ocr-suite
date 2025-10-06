@@ -3,12 +3,19 @@ name: Windows Build
 on:
   push:
     branches: [ main ]
-    tags: ["v*.*.*"]
+    tags:
+      - "v*.*.*"
   workflow_dispatch: {}
 
 jobs:
   build:
     runs-on: windows-latest
+
+    env:
+      PYTHON_VERSION: "3.9"
+      MODEL_DIR: models/base.en
+      MODEL_CACHE_KEY: fasterwhisper-base-en-${{ runner.os }}-v1
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,57 +23,134 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install build deps
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Cache faster-whisper base.en
+      # ---------- Cache & pre-download faster-whisper model ----------
+      - name: Cache faster-whisper model
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: models/base.en
-          key: fasterwhisper-base-en-${{ runner.os }}-v1
+          path: ${{ env.MODEL_DIR }}
+          key: ${{ env.MODEL_CACHE_KEY }}
 
-      - name: Pre-download faster-whisper model (base.en)
+      - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
+        shell: bash     # use bash heredoc (PowerShell breaks <<'PY')
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          python - <<'PY'
+from pathlib import Path
+Path("models").mkdir(parents=True, exist_ok=True)
+from faster_whisper import WhisperModel
+WhisperModel("base.en", device="cpu", compute_type="int8", download_root="models")
+print("Model downloaded to models/base.en")
+PY
+
+      # ---------- Ensure support files exist so spec doesn't fail ----------
+      - name: Ensure support files exist
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path models | Out-Null
-          $code = @'
-      from pathlib import Path
-      Path("models").mkdir(parents=True, exist_ok=True)
-      from faster_whisper import WhisperModel
-      WhisperModel("base.en", device="cpu", compute_type="int8", download_root="models")
-      print("Model downloaded to models/base.en")
-      '@
-          Set-Content -Path dl_model.py -Value $code -Encoding UTF8
-          python dl_model.py
+          if (-not (Test-Path -Path README.txt)) {
+            if (Test-Path -Path README.md) {
+              (Get-Content README.md -Raw) | Set-Content README.txt -Encoding UTF8
+            } else {
+              @"
+AV + OCR Suite
+==============
+Basic README stub to satisfy the build. Replace with project README.md.
+"@ | Set-Content README.txt -Encoding UTF8
+            }
+          }
+          if (-not (Test-Path -Path custom_prompt.txt)) {
+            @"
+When addressing the following prompt - keep in mind - text created from transcription is best guess phonetically by whisper AI...
+"@ | Set-Content custom_prompt.txt -Encoding UTF8
+          }
 
-
-      - name: Build EXE
+      # ---------- Build EXE ----------
+      - name: PyInstaller build
+        shell: pwsh
         run: |
           pyinstaller --clean -y AV_OCR_Suite.spec
-          dir dist\AV_OCR_Suite
+          if (-not (Test-Path dist\AV_OCR_Suite\AV_OCR_Suite.exe)) {
+            Write-Error "PyInstaller output not found."
+          }
+          Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
-      # 🔽 Replace the broken action with Chocolatey + ISCC
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup --yes --no-progress
-
-      - name: Build installer
+      # ---------- (Optional) Sign the EXE if secrets provided ----------
+      # Add these repository secrets to enable:
+      #   WINDOWS_CERT_BASE64  -> base64 of your .pfx
+      #   WINDOWS_CERT_PASSWORD -> password for the .pfx
+      #   SIGNING_TIMESTAMP_URL -> e.g. http://timestamp.sectigo.com
+      - name: Code sign EXE (optional)
+        if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' && secrets.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
         run: |
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          & "$iscc" "installer\AV_OCR_Suite.iss"
+          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
+            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
-      - name: Upload artifacts
+      # ---------- Build installer with Inno Setup ----------
+      - name: Inno Setup (install)
+        uses: compnerd/inno-setup-action@v1
+        with:
+          path: installer/AV_OCR_Suite.iss
+
+      # ---------- (Optional) Sign the installer if secrets provided ----------
+      - name: Code sign installer (optional)
+        if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' && secrets.SIGNING_TIMESTAMP_URL != '' }}
+        shell: pwsh
+        run: |
+          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
+          if (-not (Test-Path $pfxPath)) {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          }
+          $setup = Get-ChildItem -Recurse -Filter "*Setup*.exe" | Where-Object { $_.FullName -match "Output" } | Select-Object -First 1
+          if (-not $setup) { Write-Error "Installer not found under Output/**"; exit 1 }
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
+            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            "$($setup.FullName)"
+
+      # ---------- Upload build artifacts ----------
+      - name: Upload dist/
         uses: actions/upload-artifact@v4
         with:
-          name: AV_OCR_Suite-build
+          name: AV_OCR_Suite-dist
+          path: dist/AV_OCR_Suite/**
+
+      - name: Upload installer Output/
+        uses: actions/upload-artifact@v4
+        with:
+          name: AV_OCR_Suite-setup
           path: |
-            dist/AV_OCR_Suite/**
-            Output/**   # InnoSetup default output folder
+            Output/**
+            installer/Output/**
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/AV_OCR_Suite-setup/**/*
+            out/AV_OCR_Suite-dist/**/*
