@@ -42,6 +42,14 @@ jobs:
           }
           Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
+
+      # Make sure we always run at the repo root
+      - name: Ensure working directory
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          Write-Host "Workspace: $pwd"
+
       # ---------- Cache & pre-download Faster-Whisper model ----------
       - name: Cache faster-whisper model
         id: cache-model
@@ -53,8 +61,12 @@ jobs:
       - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
         shell: pwsh
+        working-directory: ${{ github.workspace }}
         run: |
-          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
+          if (-not (Test-Path .\models\base.en) -or -not (Get-ChildItem -Recurse -ErrorAction SilentlyContinue .\models\base.en)) {python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
+
+          Write-Host "Listing models dir:"
+          if (Test-Path .\models) { Get-ChildItem -Recurse -Force .\models | Format-Table -AutoSize } else { Write-Host "(no models dir)" }
 
       # ---------- Stage runtime files into dist (icon, README, model) ----------
       - name: Stage runtime files into dist
@@ -89,6 +101,7 @@ jobs:
           } else {
             Write-Host 'NOTE: models\base.en not found; installer will be built without embedded model.'
           }
+
 
       # ---------- Optional: Sign the EXE if secrets provided ----------
       - name: Code sign EXE (optional)
