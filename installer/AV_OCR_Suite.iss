@@ -87,9 +87,10 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdi
 ; Ship the README from the REPO ROOT (not dist)
 Source: "{#RepoRoot}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 
-; Ship the local faster-whisper model if present (we copy it into dist during CI;
-; if you prefer grabbing from repo root, point it to {#RepoRoot}\models\base.en\* instead)
-Source: "{#SourceDir}\models\base.en\*"; DestDir: "{app}\models\base.en"; Flags: recursesubdirs createallsubdirs ignoreversion
+; include model only if present
+Source: "{#SourceDir}\models\base.en\*"; DestDir: "{app}\models\base.en";
+    Flags: recursesubdirs createallsubdirs ignoreversion;
+    Check: DirExists(ExpandConstant('{#SourceDir}\models\base.en'))
 
 [Icons]
 ; Start Menu shortcut

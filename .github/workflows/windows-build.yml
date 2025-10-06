@@ -58,15 +58,45 @@ jobs:
           }
           Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
-      # ---------- Stage extras into dist (ICON, README, MODEL) ----------
-      - name: Stage extras into dist
+      # Cache the model so repeated builds are faster
+      - name: Cache faster-whisper model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/base.en
+          key: fasterwhisper-base-en-cache-v1
+
+      # Download model to ./models/base.en if cache missed
+      - name: Pre-download model (base.en)
+        if: steps.cache-model.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          if (Test-Path av-ocr.ico) { Copy-Item av-ocr.ico dist\AV_OCR_Suite\ -Force }
-          if (Test-Path README.txt) { Copy-Item README.txt dist\AV_OCR_Suite\ -Force }
-          if (Test-Path models\base.en) {
-            New-Item -ItemType Directory -Force -Path dist\AV_OCR_Suite\models\base.en | Out-Null
-            Copy-Item models\base.en\* dist\AV_OCR_Suite\models\base.en\ -Recurse -Force
+          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
+
+      # Stage runtime files INTO dist so the installer can find them
+      - name: Stage runtime files into dist
+        shell: pwsh
+        run: |
+          $dist = 'dist\AV_OCR_Suite'
+          if (-not (Test-Path $dist)) { Write-Error 'PyInstaller output not found'; exit 1 }
+
+          # icon
+          if (Test-Path .\av-ocr.ico) { Copy-Item .\av-ocr.ico $dist -Force }
+
+          # README.txt (Inno uses it for the post-install checkbox)
+          if (Test-Path .\README.txt) {
+            Copy-Item .\README.txt $dist -Force
+          } elseif (Test-Path .\README.md) {
+            (Get-Content .\README.md -Raw) | Set-Content (Join-Path $dist 'README.txt') -Encoding UTF8
+          }
+
+          # Copy the model if present (downloaded into ./models/base.en)
+          if (Test-Path .\models\base.en) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $dist 'models\base.en') | Out-Null
+            Copy-Item .\models\base.en\* (Join-Path $dist 'models\base.en') -Recurse -Force
+            Write-Host 'Staged model into dist\AV_OCR_Suite\models\base.en'
+          } else {
+            Write-Host 'NOTE: models\base.en not found; installer will be built without embedded model.'
           }
 
 
