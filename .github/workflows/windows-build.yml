@@ -102,48 +102,42 @@ jobs:
             Write-Host 'NOTE: models\base.en not found; installer will be built without embedded model.'
           }
 
-      # ---------- Install ffmpeg & Tesseract on the runner ----------
+      # Install runtime tools on the runner
       - name: Install ffmpeg & Tesseract (runner)
         shell: pwsh
         run: |
           choco install ffmpeg --yes --no-progress
           choco install tesseract --yes --no-progress
 
-      # ---------- Copy ffmpeg/Tesseract into the app folder ----------
+      # Stage ffmpeg & Tesseract into the built app (portable)
       - name: Stage ffmpeg & Tesseract into dist
         shell: pwsh
         run: |
           $dist = "dist\AV_OCR_Suite"
           if (-not (Test-Path $dist)) { Write-Error "PyInstaller output not found"; exit 1 }
 
-          # ---- ffmpeg (Chocolatey layout) ----
-          $ffBins = @(
-            "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin", # common
-            "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin64", # sometimes
-            "C:\Program Files\ffmpeg\bin" # fallback
-          ) | Where-Object { Test-Path $_ }
-
-          if ($ffBins.Count -gt 0) {
+          # ---- ffmpeg: find where the runner installed it ----
+          $ffExe = (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue).Source
+          if ($ffExe) {
+            $ffSrc = Split-Path $ffExe -Parent
             $ffDst = Join-Path $dist "ffmpeg"
             New-Item -ItemType Directory -Force -Path $ffDst | Out-Null
-            Copy-Item (Join-Path $ffBins[0] "*") $ffDst -Recurse -Force
-            Write-Host "ffmpeg staged to $ffDst"
+            Copy-Item (Join-Path $ffSrc '*') $ffDst -Recurse -Force
+            Write-Host "ffmpeg staged from $ffSrc -> $ffDst"
           } else {
-            Write-Host "WARNING: ffmpeg not found on runner; continuing without bundling."
+            Write-Warning "ffmpeg.exe not found on PATH; continuing without bundling."
           }
 
-          # ---- Tesseract (Chocolatey installs to Program Files) ----
-          $tessSrc = "C:\Program Files\Tesseract-OCR"
-          if (-not (Test-Path $tessSrc)) {
-            $tessSrc = "C:\Program Files (x86)\Tesseract-OCR"
-          }
-          if (Test-Path $tessSrc) {
+          # ---- Tesseract: same idea ----
+          $tessExe = (Get-Command tesseract.exe -ErrorAction SilentlyContinue).Source
+          if ($tessExe) {
+            $tessSrc = Split-Path $tessExe -Parent   # typically C:\Program Files\Tesseract-OCR
             $tessDst = Join-Path $dist "tesseract"
             New-Item -ItemType Directory -Force -Path $tessDst | Out-Null
-            Copy-Item (Join-Path $tessSrc "*") $tessDst -Recurse -Force
-            Write-Host "Tesseract staged to $tessDst"
+            Copy-Item (Join-Path $tessSrc '*') $tessDst -Recurse -Force
+            Write-Host "Tesseract staged from $tessSrc -> $tessDst"
           } else {
-            Write-Host "WARNING: Tesseract not found on runner; continuing without bundling."
+            Write-Warning "tesseract.exe not found on PATH; continuing without bundling."
           }
 
 
