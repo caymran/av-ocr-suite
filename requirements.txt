@@ -1,11 +1,12 @@
 PyQt5==5.15.11
-pyaudiowpatch==0.2.12
+pyaudiowpatch==0.2.12.7
 webrtcvad==2.0.10
 numpy==1.26.4
 pyperclip==1.9.0
-Pillow==10.4.0
-pytesseract==0.3.10
-faster-whisper==1.0.0
-ctranslate2==4.3.1
-faster-whisper==1.0.3
+pillow==10.4.0
+pytesseract==0.3.13
 
+# Whisper stack
+faster-whisper==1.0.3
+ctranslate2==4.5.0
+huggingface-hub==0.24.7
