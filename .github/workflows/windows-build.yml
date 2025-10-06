@@ -109,35 +109,49 @@ jobs:
           choco install ffmpeg --yes --no-progress
           choco install tesseract --yes --no-progress
 
-      # Stage ffmpeg & Tesseract into the built app (portable)
       - name: Stage ffmpeg & Tesseract into dist
         shell: pwsh
         run: |
           $dist = "dist\AV_OCR_Suite"
           if (-not (Test-Path $dist)) { Write-Error "PyInstaller output not found"; exit 1 }
 
-          # ---- ffmpeg: find where the runner installed it ----
+          # ---- ffmpeg: discover and copy ----
           $ffExe = (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue).Source
-          if ($ffExe) {
-            $ffSrc = Split-Path $ffExe -Parent
+          $ffSrcCandidates = @()
+          if ($ffExe) { $ffSrcCandidates += (Split-Path $ffExe -Parent) }
+          $ffSrcCandidates += @(
+            "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin",
+            "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin64",
+            "C:\Program Files\ffmpeg\bin"
+          )
+          $ffSrc = $ffSrcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($ffSrc) {
             $ffDst = Join-Path $dist "ffmpeg"
             New-Item -ItemType Directory -Force -Path $ffDst | Out-Null
+            Write-Host "Copying ffmpeg from: $ffSrc"
+            Get-ChildItem $ffSrc | Format-Table -AutoSize
             Copy-Item (Join-Path $ffSrc '*') $ffDst -Recurse -Force
-            Write-Host "ffmpeg staged from $ffSrc -> $ffDst"
           } else {
-            Write-Warning "ffmpeg.exe not found on PATH; continuing without bundling."
+            Write-Warning "ffmpeg not found; continuing without bundling."
           }
 
-          # ---- Tesseract: same idea ----
+          # ---- Tesseract: discover and copy ----
           $tessExe = (Get-Command tesseract.exe -ErrorAction SilentlyContinue).Source
-          if ($tessExe) {
-            $tessSrc = Split-Path $tessExe -Parent   # typically C:\Program Files\Tesseract-OCR
+          $tessSrcCandidates = @()
+          if ($tessExe) { $tessSrcCandidates += (Split-Path $tessExe -Parent) }  # e.g., C:\Program Files\Tesseract-OCR
+          $tessSrcCandidates += @(
+            "C:\Program Files\Tesseract-OCR",
+            "C:\Program Files (x86)\Tesseract-OCR"
+          )
+          $tessSrc = $tessSrcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($tessSrc) {
             $tessDst = Join-Path $dist "tesseract"
             New-Item -ItemType Directory -Force -Path $tessDst | Out-Null
+            Write-Host "Copying Tesseract from: $tessSrc"
+            Get-ChildItem $tessSrc | Format-Table -AutoSize
             Copy-Item (Join-Path $tessSrc '*') $tessDst -Recurse -Force
-            Write-Host "Tesseract staged from $tessSrc -> $tessDst"
           } else {
-            Write-Warning "tesseract.exe not found on PATH; continuing without bundling."
+            Write-Warning "Tesseract not found; continuing without bundling."
           }
 
 
