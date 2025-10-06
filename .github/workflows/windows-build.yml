@@ -209,13 +209,29 @@ jobs:
 
 
 
-      # ---------- Upload build artifacts ----------
+      # ---------- Generate checksums ----------
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          if (Test-Path dist\AV_OCR_Suite\AV_OCR_Suite.exe) {
+            Get-FileHash dist\AV_OCR_Suite\AV_OCR_Suite.exe -Algorithm SHA256 |
+              ForEach-Object { "$($_.Hash)  AV_OCR_Suite.exe" } |
+              Out-File dist\AV_OCR_Suite\AV_OCR_Suite.exe.sha256 -Encoding ASCII
+          }
+          $setup = Get-ChildItem -Recurse -Filter "*Setup*.exe" | Where-Object { $_.FullName -match "Output" } | Select-Object -First 1
+          if ($setup) {
+            Get-FileHash "$($setup.FullName)" -Algorithm SHA256 |
+              ForEach-Object { "$($_.Hash)  $($setup.Name)" } |
+              Out-File "$($setup.DirectoryName)\$($setup.Name).sha256" -Encoding ASCII
+          }
+
+      # ---------- Upload artifacts ----------
       - name: Upload dist/
         uses: actions/upload-artifact@v4
         with:
           name: AV_OCR_Suite-dist
-          path: dist/AV_OCR_Suite/**
-
+          path: |
+            dist/AV_OCR_Suite/**
       - name: Upload installer Output/
         uses: actions/upload-artifact@v4
         with:
@@ -224,16 +240,27 @@ jobs:
             Output/**
             installer/Output/**
 
-        - name: Create GitHub Release
-          if: startsWith(github.ref, 'refs/tags/')
-          uses: softprops/action-gh-release@v2
-          with:
-            files: |
-              Output/*.exe
-              installer/Output/*.exe
-            name: AV + OCR Suite ${{ github.ref_name }}
-            body: |
-              Automated build for ${{ github.ref_name }}
-              Includes bundled model, ffmpeg, and Tesseract.
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  release:
+    needs: build
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AV + OCR Suite ${{ github.ref_name }}
+          body: |
+            Automated Windows release for ${{ github.ref_name }}.
+            Includes bundled Whisper base.en (if cached), ffmpeg, and Tesseract.
+          files: |
+            out/AV_OCR_Suite-setup/**/*.exe
+            out/AV_OCR_Suite-setup/**/*.sha256
+            out/AV_OCR_Suite-dist/AV_OCR_Suite/AV_OCR_Suite.exe
+            out/AV_OCR_Suite-dist/AV_OCR_Suite/AV_OCR_Suite.exe.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
