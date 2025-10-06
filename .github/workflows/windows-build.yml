@@ -44,15 +44,7 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path models | Out-Null
-          @"
-from pathlib import Path
-Path('models').mkdir(parents=True, exist_ok=True)
-from faster_whisper import WhisperModel
-WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models')
-print('Model downloaded to models/base.en')
-"@ | Set-Content dl_model.py -Encoding UTF8
-          python dl_model.py
+          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
 
       # ---------- Ensure support files exist so spec doesn't fail ----------
       - name: Ensure support files exist
@@ -62,17 +54,17 @@ print('Model downloaded to models/base.en')
             if (Test-Path -Path README.md) {
               (Get-Content README.md -Raw) | Set-Content README.txt -Encoding UTF8
             } else {
-              @"
+@'
 AV + OCR Suite
 ==============
 Basic README stub to satisfy the build. Replace with project README.md.
-"@ | Set-Content README.txt -Encoding UTF8
+'@ | Set-Content README.txt -Encoding UTF8
             }
           }
           if (-not (Test-Path -Path custom_prompt.txt)) {
-            @"
+@'
 When addressing the following prompt - keep in mind - text created from transcription is best guess phonetically by whisper AI...
-"@ | Set-Content custom_prompt.txt -Encoding UTF8
+'@ | Set-Content custom_prompt.txt -Encoding UTF8
           }
 
       # ---------- Build EXE ----------
@@ -87,9 +79,7 @@ When addressing the following prompt - keep in mind - text created from transcri
 
       # ---------- (Optional) Sign the EXE if secrets provided ----------
       # Add these repository secrets to enable:
-      #   WINDOWS_CERT_BASE64  -> base64 of your .pfx
-      #   WINDOWS_CERT_PASSWORD -> password for the .pfx
-      #   SIGNING_TIMESTAMP_URL -> e.g. http://timestamp.sectigo.com
+      #   WINDOWS_CERT_BASE64, WINDOWS_CERT_PASSWORD, SIGNING_TIMESTAMP_URL
       - name: Code sign EXE (optional)
         if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' && secrets.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
@@ -134,6 +124,7 @@ When addressing the following prompt - keep in mind - text created from transcri
         uses: actions/upload-artifact@v4
         with:
           name: AV_OCR_Suite-setup
+        # Include both common output roots just in case
           path: |
             Output/**
             installer/Output/**
