@@ -223,3 +223,17 @@ jobs:
           path: |
             Output/**
             installer/Output/**
+
+        - name: Create GitHub Release
+          if: startsWith(github.ref, 'refs/tags/')
+          uses: softprops/action-gh-release@v2
+          with:
+            files: |
+              Output/*.exe
+              installer/Output/*.exe
+            name: AV + OCR Suite ${{ github.ref_name }}
+            body: |
+              Automated build for ${{ github.ref_name }}
+              Includes bundled model, ffmpeg, and Tesseract.
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
