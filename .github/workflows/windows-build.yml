@@ -14,7 +14,6 @@ jobs:
     env:
       PYTHON_VERSION: "3.9"
       MODEL_DIR: models/base.en
-      # Use a static key to avoid runner context issues in env
       MODEL_CACHE_KEY: fasterwhisper-base-en-cache-v1
 
     steps:
@@ -33,7 +32,7 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # ---------- Build EXE ----------
+      # ---------- Build EXE first (so we have dist/ ready) ----------
       - name: PyInstaller build
         shell: pwsh
         run: |
@@ -43,29 +42,29 @@ jobs:
           }
           Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
-      # Cache the model so repeated builds are faster
+      # ---------- Cache & pre-download Faster-Whisper model ----------
       - name: Cache faster-whisper model
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: models/base.en
-          key: fasterwhisper-base-en-cache-v1
+          path: ${{ env.MODEL_DIR }}
+          key: ${{ env.MODEL_CACHE_KEY }}
 
-      # Download model to ./models/base.en if cache missed
       - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: pwsh
+        shell: bash
         run: |
-          $ws = "${{ github.workspace }}"
-          python - << 'PY'
-      from pathlib import Path
-      from faster_whisper import WhisperModel
-      root = Path(r"${{ github.workspace }}") / "models"
-      root.mkdir(parents=True, exist_ok=True)
-      WhisperModel("base.en", device="cpu", compute_type="int8", download_root=str(root))
-      print(f"Model downloaded to {root / 'base.en'}")
-      PY
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+          root = Path("models")
+          root.mkdir(parents=True, exist_ok=True)
+          WhisperModel("base.en", device="cpu", compute_type="int8", download_root=str(root))
+          print("Model downloaded to", root / "base.en")
+          PY
 
+      # ---------- Stage runtime files into dist (icon, README, model) ----------
       - name: Stage runtime files into dist
         shell: pwsh
         run: |
@@ -73,15 +72,11 @@ jobs:
           $dist = Join-Path $ws 'dist\AV_OCR_Suite'
           if (-not (Test-Path $dist)) { Write-Error "PyInstaller output not found at $dist"; exit 1 }
 
-          Write-Host "Workspace: $ws"
-          Write-Host "Listing models dir (if any):"
-          if (Test-Path (Join-Path $ws 'models')) { Get-ChildItem -Recurse -Force (Join-Path $ws 'models') | Format-Table -AutoSize } else { Write-Host "(no models dir)" }
-
           # icon
           $ico = Join-Path $ws 'av-ocr.ico'
           if (Test-Path $ico) { Copy-Item $ico $dist -Force }
 
-          # README.txt (Inno uses it for the post-install checkbox)
+          # README.txt (used by installer post-install checkbox)
           $readmeTxt = Join-Path $ws 'README.txt'
           $readmeMd  = Join-Path $ws 'README.md'
           if (Test-Path $readmeTxt) {
@@ -92,7 +87,7 @@ jobs:
             "AV + OCR Suite`n`nGenerated README placeholder." | Set-Content (Join-Path $dist 'README.txt') -Encoding UTF8
           }
 
-          # Copy the model if present (downloaded into $ws\models\base.en)
+          # Copy the model if present (downloaded into ./models/base.en)
           $modelSrc = Join-Path $ws 'models\base.en'
           $modelDst = Join-Path $dist 'models\base.en'
           if (Test-Path $modelSrc) {
@@ -100,26 +95,23 @@ jobs:
             Copy-Item (Join-Path $modelSrc '*') $modelDst -Recurse -Force
             Write-Host "Staged model into $modelDst"
           } else {
-            Write-Host 'NOTE: models\base.en not found under workspace; installer will be built without embedded model.'
+            Write-Host 'NOTE: models\base.en not found; installer will be built without embedded model.'
           }
 
-
-      # ---------- (Optional) Sign the EXE if secrets provided ----------
+      # ---------- Optional: Sign the EXE if secrets provided ----------
+      # Set repo secrets: WINDOWS_CERT_BASE64, WINDOWS_CERT_PASSWORD, SIGNING_TIMESTAMP_URL
       - name: Code sign EXE (optional)
+        if: ${{ secrets.WINDOWS_CERT_BASE64 && secrets.WINDOWS_CERT_PASSWORD && secrets.SIGNING_TIMESTAMP_URL }}
         shell: pwsh
-        env:
-          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
-          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD -or -not $env:SIGNING_TIMESTAMP_URL) {
-            Write-Host "Skipping EXE code signing (secrets not set)."
-            exit 0
-          }
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 dist\AV_OCR_Suite\AV_OCR_Suite.exe
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
+            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
+      # ---------- Install Inno Setup & build installer ----------
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --yes --no-progress
@@ -137,26 +129,21 @@ jobs:
                "/DSourceDir=$distAbs" `
                installer\AV_OCR_Suite.iss
 
-
-      # ---------- (Optional) Sign the installer if secrets provided ----------
+      # ---------- Optional: Sign the installer ----------
       - name: Code sign installer (optional)
+        if: ${{ secrets.WINDOWS_CERT_BASE64 && secrets.WINDOWS_CERT_PASSWORD && secrets.SIGNING_TIMESTAMP_URL }}
         shell: pwsh
-        env:
-          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
-          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD -or -not $env:SIGNING_TIMESTAMP_URL) {
-            Write-Host "Skipping installer code signing (secrets not set)."
-            exit 0
-          }
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
           if (-not (Test-Path $pfxPath)) {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
           }
           $setup = Get-ChildItem -Recurse -Filter "*Setup*.exe" | Where-Object { $_.FullName -match "Output" } | Select-Object -First 1
           if (-not $setup) { Write-Error "Installer not found under Output/**"; exit 1 }
-          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 "$($setup.FullName)"
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
+            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            "$($setup.FullName)"
 
       # ---------- Upload build artifacts ----------
       - name: Upload dist/
@@ -172,20 +159,3 @@ jobs:
           path: |
             Output/**
             installer/Output/**
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: out
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            out/AV_OCR_Suite-setup/**/*
-            out/AV_OCR_Suite-dist/**/*
