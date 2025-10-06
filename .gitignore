@@ -12,7 +12,10 @@ env/
 # PyInstaller / builds
 build/
 dist/
+
+# Ignore all spec files except PyInstaller one
 *.spec
+!AV_OCR_Suite.spec
 
 # App runtime folders
 archives/
@@ -29,4 +32,5 @@ ffmpeg/
 Thumbs.db
 .vscode/
 .idea/
+
 
