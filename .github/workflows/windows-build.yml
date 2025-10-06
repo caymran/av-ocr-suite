@@ -77,11 +77,14 @@ jobs:
             /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
             dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
-      # ---------- Build installer with Inno Setup ----------
-      - name: Inno Setup (install)
-        uses: compnerd/inno-setup-action@v1
-        with:
-          path: installer/AV_OCR_Suite.iss
+      # Alternative (skip if using Chocolatey approach)
+      - name: Setup Inno
+        uses: crazy-max/ghaction-setup-inno@v3
+
+      - name: Build installer
+        shell: pwsh
+        run: iscc "installer\AV_OCR_Suite.iss"
+
 
       # ---------- (Optional) Sign the installer if secrets provided ----------
       - name: Code sign installer (optional)
