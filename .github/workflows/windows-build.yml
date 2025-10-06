@@ -72,10 +72,7 @@ jobs:
           }
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
-            /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" `
-            /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
-            dist\AV_OCR_Suite\AV_OCR_Suite.exe
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
       - name: Install Inno Setup
         shell: pwsh
@@ -86,9 +83,7 @@ jobs:
       - name: Build installer with Inno Setup
         shell: pwsh
         run: |
-          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
-            /Qp `
-            "installer\AV_OCR_Suite.iss"
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /Qp "installer\AV_OCR_Suite.iss"
 
 
 
@@ -110,10 +105,7 @@ jobs:
           }
           $setup = Get-ChildItem -Recurse -Filter "*Setup*.exe" | Where-Object { $_.FullName -match "Output" } | Select-Object -First 1
           if (-not $setup) { Write-Error "Installer not found under Output/**"; exit 1 }
-          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
-            /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" `
-            /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
-            "$($setup.FullName)"
+          & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 "$($setup.FullName)"
 
       # ---------- Upload build artifacts ----------
       - name: Upload dist/
