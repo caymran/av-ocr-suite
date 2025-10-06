@@ -56,32 +56,51 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
+          $ws = "${{ github.workspace }}"
+          python - << 'PY'
+      from pathlib import Path
+      from faster_whisper import WhisperModel
+      root = Path(r"${{ github.workspace }}") / "models"
+      root.mkdir(parents=True, exist_ok=True)
+      WhisperModel("base.en", device="cpu", compute_type="int8", download_root=str(root))
+      print(f"Model downloaded to {root / 'base.en'}")
+      PY
 
-      # Stage runtime files INTO dist so the installer can find them
       - name: Stage runtime files into dist
         shell: pwsh
         run: |
-          $dist = 'dist\AV_OCR_Suite'
-          if (-not (Test-Path $dist)) { Write-Error 'PyInstaller output not found'; exit 1 }
+          $ws   = "${{ github.workspace }}"
+          $dist = Join-Path $ws 'dist\AV_OCR_Suite'
+          if (-not (Test-Path $dist)) { Write-Error "PyInstaller output not found at $dist"; exit 1 }
+
+          Write-Host "Workspace: $ws"
+          Write-Host "Listing models dir (if any):"
+          if (Test-Path (Join-Path $ws 'models')) { Get-ChildItem -Recurse -Force (Join-Path $ws 'models') | Format-Table -AutoSize } else { Write-Host "(no models dir)" }
 
           # icon
-          if (Test-Path .\av-ocr.ico) { Copy-Item .\av-ocr.ico $dist -Force }
+          $ico = Join-Path $ws 'av-ocr.ico'
+          if (Test-Path $ico) { Copy-Item $ico $dist -Force }
 
           # README.txt (Inno uses it for the post-install checkbox)
-          if (Test-Path .\README.txt) {
-            Copy-Item .\README.txt $dist -Force
-          } elseif (Test-Path .\README.md) {
-            (Get-Content .\README.md -Raw) | Set-Content (Join-Path $dist 'README.txt') -Encoding UTF8
+          $readmeTxt = Join-Path $ws 'README.txt'
+          $readmeMd  = Join-Path $ws 'README.md'
+          if (Test-Path $readmeTxt) {
+            Copy-Item $readmeTxt $dist -Force
+          } elseif (Test-Path $readmeMd) {
+            (Get-Content $readmeMd -Raw) | Set-Content (Join-Path $dist 'README.txt') -Encoding UTF8
+          } else {
+            "AV + OCR Suite`n`nGenerated README placeholder." | Set-Content (Join-Path $dist 'README.txt') -Encoding UTF8
           }
 
-          # Copy the model if present (downloaded into ./models/base.en)
-          if (Test-Path .\models\base.en) {
-            New-Item -ItemType Directory -Force -Path (Join-Path $dist 'models\base.en') | Out-Null
-            Copy-Item .\models\base.en\* (Join-Path $dist 'models\base.en') -Recurse -Force
-            Write-Host 'Staged model into dist\AV_OCR_Suite\models\base.en'
+          # Copy the model if present (downloaded into $ws\models\base.en)
+          $modelSrc = Join-Path $ws 'models\base.en'
+          $modelDst = Join-Path $dist 'models\base.en'
+          if (Test-Path $modelSrc) {
+            New-Item -ItemType Directory -Force -Path $modelDst | Out-Null
+            Copy-Item (Join-Path $modelSrc '*') $modelDst -Recurse -Force
+            Write-Host "Staged model into $modelDst"
           } else {
-            Write-Host 'NOTE: models\base.en not found; installer will be built without embedded model.'
+            Write-Host 'NOTE: models\base.en not found under workspace; installer will be built without embedded model.'
           }
 
 
