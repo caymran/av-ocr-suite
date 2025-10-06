@@ -88,9 +88,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdi
 Source: "{#RepoRoot}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 ; include model only if present
-Source: "{#SourceDir}\models\base.en\*"; DestDir: "{app}\models\base.en";
-    Flags: recursesubdirs createallsubdirs ignoreversion;
-    Check: DirExists(ExpandConstant('{#SourceDir}\models\base.en'))
+Source: "{#SourceDir}\models\base.en\*"; DestDir: "{app}\models\base.en"; Flags: recursesubdirs createallsubdirs ignoreversion; Check: DirExists(ExpandConstant('{#SourceDir}\models\base.en'))
 
 [Icons]
 ; Start Menu shortcut
