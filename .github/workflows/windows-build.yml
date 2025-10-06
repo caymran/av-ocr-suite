@@ -77,13 +77,19 @@ jobs:
             /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
             dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
-      # Alternative (skip if using Chocolatey approach)
-      - name: Setup Inno
-        uses: crazy-max/ghaction-setup-inno@v3
-
-      - name: Build installer
+      - name: Install Inno Setup
         shell: pwsh
-        run: iscc "installer\AV_OCR_Suite.iss"
+        run: |
+          choco install innosetup --yes --no-progress
+          "$(& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /?)" > $null
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
+            /Qp `
+            "installer\AV_OCR_Suite.iss"
+
 
 
       # ---------- (Optional) Sign the installer if secrets provided ----------
