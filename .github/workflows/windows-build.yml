@@ -14,7 +14,8 @@ jobs:
     env:
       PYTHON_VERSION: "3.9"
       MODEL_DIR: models/base.en
-      MODEL_CACHE_KEY: fasterwhisper-base-en-${{ runner.os }}-v1
+      # Use a static key to avoid runner context issues in env
+      MODEL_CACHE_KEY: fasterwhisper-base-en-cache-v1
 
     steps:
       - name: Checkout
@@ -58,16 +59,22 @@ jobs:
           Get-ChildItem -Recurse dist\AV_OCR_Suite | Format-Table -AutoSize
 
       # ---------- (Optional) Sign the EXE if secrets provided ----------
-      # Requires secrets: WINDOWS_CERT_BASE64, WINDOWS_CERT_PASSWORD, SIGNING_TIMESTAMP_URL
       - name: Code sign EXE (optional)
-        if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' && secrets.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
+          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD -or -not $env:SIGNING_TIMESTAMP_URL) {
+            Write-Host "Skipping EXE code signing (secrets not set)."
+            exit 0
+          }
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
           & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
-            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
-            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" `
+            /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
             dist\AV_OCR_Suite\AV_OCR_Suite.exe
 
       # ---------- Build installer with Inno Setup ----------
@@ -78,18 +85,25 @@ jobs:
 
       # ---------- (Optional) Sign the installer if secrets provided ----------
       - name: Code sign installer (optional)
-        if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' && secrets.SIGNING_TIMESTAMP_URL != '' }}
         shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
+          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD -or -not $env:SIGNING_TIMESTAMP_URL) {
+            Write-Host "Skipping installer code signing (secrets not set)."
+            exit 0
+          }
           $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
           if (-not (Test-Path $pfxPath)) {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
           }
           $setup = Get-ChildItem -Recurse -Filter "*Setup*.exe" | Where-Object { $_.FullName -match "Output" } | Select-Object -First 1
           if (-not $setup) { Write-Error "Installer not found under Output/**"; exit 1 }
           & "$env:ProgramFiles (x86)\Windows Kits\10\App Certification Kit\signtool.exe" sign `
-            /f "$pfxPath" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
-            /tr "${{ secrets.SIGNING_TIMESTAMP_URL }}" /td sha256 /fd sha256 `
+            /f "$pfxPath" /p "$env:WINDOWS_CERT_PASSWORD" `
+            /tr "$env:SIGNING_TIMESTAMP_URL" /td sha256 /fd sha256 `
             "$($setup.FullName)"
 
       # ---------- Upload build artifacts ----------
