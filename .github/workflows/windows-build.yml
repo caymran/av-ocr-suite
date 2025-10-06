@@ -47,22 +47,14 @@ jobs:
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: ${{ env.MODEL_DIR }}
-          key: ${{ env.MODEL_CACHE_KEY }}
+          path: ${{ models/base.en }}
+          key: ${{ fasterwhisper-base-en-cache-v1 }}
 
       - name: Pre-download model (base.en)
         if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          from faster_whisper import WhisperModel
-          root = Path("models")
-          root.mkdir(parents=True, exist_ok=True)
-          WhisperModel("base.en", device="cpu", compute_type="int8", download_root=str(root))
-          print("Model downloaded to", root / "base.en")
-          PY
+          python -c "from pathlib import Path; Path('models').mkdir(parents=True, exist_ok=True); from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='models'); print('Model downloaded to models/base.en')"
 
       # ---------- Stage runtime files into dist (icon, README, model) ----------
       - name: Stage runtime files into dist
