@@ -2,36 +2,23 @@ name: Windows Build
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [ main ]
+    tags: ["v*.*.*"]
   workflow_dispatch: {}
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.9"
-          cache: "pip"
 
-      - name: Install system deps (FFmpeg)
-        shell: pwsh
-        run: |
-          choco install ffmpeg -y
-          ffmpeg -version | Select-Object -First 2
-
-      - name: Install Python deps
+      - name: Install build deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -42,67 +29,21 @@ jobs:
           pyinstaller --clean -y AV_OCR_Suite.spec
           dir dist\AV_OCR_Suite
 
-      - name: Code sign EXE
-        if: ${{ env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' && env.SIGNING_TIMESTAMP_URL != '' }}
+      # 🔽 Replace the broken action with Chocolatey + ISCC
+      - name: Install Inno Setup
         shell: pwsh
-        env:
-          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
-        run: |
-          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          $exe = (Get-ChildItem "dist\AV_OCR_Suite\*.exe" | Select-Object -First 1).FullName
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-                      Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
-                      Select-Object -First 1 -ExpandProperty FullName
-          & "$signtool" sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /tr $env:SIGNING_TIMESTAMP_URL /td sha256 /fd sha256 "$exe"
+        run: choco install innosetup --yes --no-progress
 
-      - name: Build Installer
-        uses: Minionguyjpro/Inno-Setup-Action@v1
-        with:
-          path: installer/AV_OCR_Suite.iss
-
-      - name: Code sign Installer
-        if: ${{ env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' && env.SIGNING_TIMESTAMP_URL != '' }}
+      - name: Build installer
         shell: pwsh
-        env:
-          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-          SIGNING_TIMESTAMP_URL: ${{ secrets.SIGNING_TIMESTAMP_URL }}
         run: |
-          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          if (-not (Test-Path $pfxPath)) {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          }
-          $setup = (Get-ChildItem "Output\*Setup*.exe" | Select-Object -First 1).FullName
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-                      Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
-                      Select-Object -First 1 -ExpandProperty FullName
-          & "$signtool" sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /tr $env:SIGNING_TIMESTAMP_URL /td sha256 /fd sha256 "$setup"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & "$iscc" "installer\AV_OCR_Suite.iss"
 
-      - name: Upload build artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: AV_OCR_Suite-build
           path: |
             dist/AV_OCR_Suite/**
-            Output/**
-
-  release:
-    needs: build
-    runs-on: windows-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: AV_OCR_Suite-build
-          path: out
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            out/Output/*Setup*.exe
-            out/dist/AV_OCR_Suite/**/*
+            Output/**   # InnoSetup default output folder
