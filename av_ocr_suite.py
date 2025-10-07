@@ -2107,6 +2107,8 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
+        app = QtWidgets.QApplication(sys.argv)
+
         def log_ffmpeg_info_once():
             import shutil, subprocess
             p = shutil.which("ffmpeg")
@@ -2126,8 +2128,6 @@ if __name__ == "__main__":
         _enable_tesseract_if_present()
         log_ffmpeg_info_once()
 
-        app = QtWidgets.QApplication(sys.argv)
-
         # set default application icon early
         try:
             icon_path = _frozen_base_dir() / "av-ocr.ico"
@@ -2142,40 +2142,20 @@ if __name__ == "__main__":
         window.show(); window.raise_(); window.activateWindow()
         log.info("Window shown; loading speech model in the background…"); safe_flush()
 
+        # Background model loader thread (CTRANSLATE2 / faster-whisper)
         def _load_model_bg():
             try:
                 from faster_whisper import WhisperModel
-
-                # Where the exe is running from (PyInstaller MEIPASS-aware)
-                base_dir = _frozen_base_dir()
-                bundled = base_dir / "models" / "base.en"     # put model here in your build
-                cache_root = APP_CACHE                        # e.g. %LOCALAPPDATA%\AV_OCR_Suite\models_cache
-
-                # Allow override via env (absolute directory or HF repo id)
-                env_name = os.getenv("AVOS_WHISPER_MODEL")
-                model_name = env_name if env_name else "base.en"
-
-                if bundled.exists():
-                    # Load the model directly from the bundled folder; no downloads
-                    mdl = WhisperModel(
-                        str(bundled),
-                        device="cpu",
-                        compute_type=os.getenv("AVOS_COMPUTE", "int8"),
-                        local_files_only=True,
-                    )
-                else:
-                    # No bundled model: use cache/download_root
-                    mdl = WhisperModel(
-                        model_name,
-                        device="cpu",
-                        compute_type=os.getenv("AVOS_COMPUTE", "int8"),
-                        cpu_threads=max(1, os.cpu_count() or 1),
-                        download_root=str(cache_root),
-                        local_files_only=False,
-                    )
-
+                model_name = os.getenv("AVOS_WHISPER_MODEL", "base.en")
+                mdl = WhisperModel(
+                    model_name,
+                    device="cpu",
+                    compute_type=os.getenv("AVOS_COMPUTE", "int8"),
+                    cpu_threads=max(1, os.cpu_count() or 1),
+                    download_root=str(APP_CACHE),
+                    local_files_only=False,
+                )
                 window.model_ready.emit(mdl)
-
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
 
