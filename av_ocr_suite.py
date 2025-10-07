@@ -1122,6 +1122,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         try:
             jabra_device = None
             speakers_device = None
+            remote_device = None
             count = self.pa.get_device_count()
             for i in range(count):
                 info = self.pa.get_device_info_by_index(i)
@@ -1131,11 +1132,13 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         jabra_device = i
                     elif "speakers" in name and speakers_device is None:
                         speakers_device = i
+                    elif "remote" in name and remote_device is None:
+                        remote_device = i
             if jabra_device is not None:
                 return jabra_device
             if speakers_device is not None:
-                return speakers_device
-            info = self.pa.get_default_input_device_info()
+                return speakers_device            if remote_device is not None:
+                return remote_device            info = self.pa.get_default_input_device_info()
             return info['index']
         except Exception:
             log.exception("Default Device Selection Error")
