@@ -2052,12 +2052,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 wav_path = str(TEMP_WAV)
 
             n_frames = len(self.session_frames)
+            self._append_log(f"[export] frames={n_frames} wav={wav_path!s}")
 
             def wav_ok(p: str | Path, min_bytes: int = 1024) -> bool:
                 try:
                     pp = Path(p) if p else None
-                    return bool(pp and pp.exists() and pp.stat().st_size >= min_bytes)
-                except Exception:
+                    ok = bool(pp and pp.exists() and pp.stat().st_size >= min_bytes)
+                    if not ok:
+                        self._append_log(f"[export] WAV missing/too small: {p}")
+                    return ok
+                except Exception as e:
+                    self._append_log(f"[export] WAV check error: {e}")
                     return False
 
             def has_usable_frames() -> bool:
@@ -2069,11 +2074,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
             have_wav = wav_ok(wav_path)
             usable_frames = has_usable_frames()
-            self._append_log(f"[export] frames={n_frames}  wav_exists={have_wav}  wav={wav_path!s}")
 
             if not usable_frames and not have_wav:
                 self._append_log("[export] Nothing to export (no frames and no wav).")
                 return
+
+       
 
             if usable_frames:
                 out_mp4 = video_mp4_path(self.meeting_name)
@@ -2149,31 +2155,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log("Close event triggered.")
 
         try:
+            # 1) Stop ongoing capture ASAP so WAV is final
             self._append_log("[shutdown] stopping OCR…")
             try: self.ocr_tab.shutdown()
-            except Exception:
-                logging.getLogger("transcriber").exception("OCR shutdown failed")
+            except Exception: logging.getLogger("transcriber").exception("OCR shutdown failed")
 
             self._append_log("[shutdown] stopping audio recording (if active)…")
             try: self.audio_tab.stop_recording_if_active()
-            except Exception:
-                logging.getLogger("transcriber").exception("Audio stop failed")
+            except Exception: logging.getLogger("transcriber").exception("Audio stop failed")
 
-            self._append_log("[shutdown] shutting down audio subsystem…")
-            try: self.audio_tab.shutdown()
-            except Exception:
-                logging.getLogger("transcriber").exception("Audio shutdown failed")
-
-            # Latch WAV path regardless of state
-            if self.last_audio_path is None and getattr(self.audio_tab, "recording_path", None):
-                self.last_audio_path = self.audio_tab.recording_path
-            if (not self.last_audio_path) and Path(TEMP_WAV).exists():
-                self.last_audio_path = str(TEMP_WAV)
-
-            QtWidgets.QApplication.processEvents()
-            time.sleep(0.10)
-
-            # Flush + transcripts
+            # 2) FLUSH + EXPORT *BEFORE* tearing down PyAudio
             self._append_log("[shutdown] flushing any pending transcription…")
             try:
                 self.audio_tab.flush_pending_transcription()
@@ -2185,15 +2176,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._write_final_transcripts()
             except Exception:
                 logging.getLogger("transcriber").exception("Final transcript write failed")
-        finally:
-            # Export attempt is GUARANTEED (even if any of the above failed)
+
             self._append_log("[shutdown] starting export…")
             try:
                 self._export_artifacts()
                 self._export_done = True
             except Exception:
-                logging.getLogger("transcriber").exception("Export failed in closeEvent.")
+                logging.getLogger("transcriber").exception("Export failed in closeEvent (early).")
 
+            # 3) Now tear down audio (can be slow / flaky on VPS devices)
+            self._append_log("[shutdown] shutting down audio subsystem…")
+            try: self.audio_tab.shutdown()
+            except Exception:
+                logging.getLogger("transcriber").exception("Audio shutdown failed")
+
+        finally:
             self._append_log("[shutdown] cleaning temp folder…")
             try:
                 self._cleanup_temps()
