@@ -267,7 +267,7 @@ jobs:
           name: AV + OCR Suite ${{ github.ref_name }}
           body: |
             Automated Windows release for ${{ github.ref_name }}.
-           Includes bundled Whisper base.en (if cached), ffmpeg, and Tesseract.
+            Includes bundled Whisper base.en (if cached), ffmpeg, and Tesseract.
           files: |
             out/**/Output/**/*.exe
             out/**/Output/**/*.sha256
