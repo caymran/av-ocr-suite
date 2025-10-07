@@ -1228,10 +1228,20 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         if int(info.get('maxInputChannels', 0)) <= 0:
                             raise ValueError(f"Device '{info['name']}' cannot be used as input.")
                         max_channels = int(info.get('maxInputChannels', 1))
-                        sample_rate = int(info.get('defaultSampleRate', 44100))
+                        
+
+                        # Choose a VAD-supported sample rate
+                        supported = {8000, 16000, 32000, 48000}
+                        default_sr = int(info.get('defaultSampleRate', 44100))
+                        sample_rate = default_sr if default_sr in supported else 48000  # force 48k if e.g. 44100
                         self.sample_rate = sample_rate
-                        self.channels = min(max_channels, 2)
-                        self.chunk_size = int(self.sample_rate * CHUNK_DURATION_MS / 1000)
+
+                        self.channels = min(int(info.get('maxInputChannels', 1)), 2)
+
+                        # Prefer 20 ms frames for VAD stability
+                        chunk_ms = 20
+                        self.chunk_size = int(self.sample_rate * chunk_ms / 1000)
+
                         local_stream = self.pa.open(
                             format=FORMAT, channels=self.channels, rate=self.sample_rate,
                             input=True, frames_per_buffer=self.chunk_size, input_device_index=self.device_index
