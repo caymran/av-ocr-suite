@@ -304,6 +304,21 @@ def _ffmpeg_exists() -> bool:
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
+def _resample_i16_for_vad(mono_i16: np.ndarray, src_sr: int, dst_sr: int) -> bytes:
+    """Quick/cheap linear resample int16 -> int16 for short VAD frames."""
+    if src_sr == dst_sr:
+        return mono_i16.tobytes()
+    x = mono_i16.astype(np.float32) / 32768.0
+    dur = x.size / float(src_sr)
+    if dur <= 0.0:
+        return b""
+    n_new = max(1, int(round(dur * dst_sr)))
+    t_old = np.linspace(0.0, dur, num=x.size, endpoint=False, dtype=np.float32)
+    t_new = np.linspace(0.0, dur, num=n_new,   endpoint=False, dtype=np.float32)
+    y = np.interp(t_new, t_old, x)
+    y16 = np.clip(np.round(y * 32768.0), -32768, 32767).astype(np.int16)
+    return y16.tobytes()
+
 
 def export_archive_build_video(frames_with_ts, wav_path=None, crf=28, output_path=None):
     """
@@ -1214,38 +1229,66 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, stream_and_start)
 
     def open_stream(self):
-        if self.device_index is None:
-            return False
         try:
             with self.opening_lock:
                 self.open_gen += 1
                 my_gen = self.open_gen
                 open_done = Event()
+
                 def try_open():
                     local_stream = None
                     try:
                         info = self.pa.get_device_info_by_index(self.device_index)
-                        if int(info.get('maxInputChannels', 0)) <= 0:
-                            raise ValueError(f"Device '{info['name']}' cannot be used as input.")
-                        max_channels = int(info.get('maxInputChannels', 1))
-                        
 
-                        # Choose a VAD-supported sample rate
-                        supported = {8000, 16000, 32000, 48000}
+                        max_in = int(info.get('maxInputChannels', 0))
+                        if max_in <= 0:
+                            raise ValueError(f"Device '{info.get('name','?')}' has no input channels.")
+
+                        # Candidate sample rates: device default first, then common ones
                         default_sr = int(info.get('defaultSampleRate', 44100))
-                        sample_rate = default_sr if default_sr in supported else 48000  # force 48k if e.g. 44100
-                        self.sample_rate = sample_rate
+                        candidates = []
+                        for sr in (default_sr, 48000, 44100, 32000, 16000, 8000):
+                            if sr and sr not in candidates:
+                                candidates.append(sr)
 
-                        self.channels = min(int(info.get('maxInputChannels', 1)), 2)
+                        # Try 2 → 1 channels
+                        chan_candidates = [min(max_in, 2), 1] if max_in >= 2 else [1]
 
-                        # Prefer 20 ms frames for VAD stability
-                        chunk_ms = 20
+                        picked_sr = None
+                        picked_ch = None
+                        chunk_ms = 20  # 20ms frames are ideal for VAD
+
+                        last_err = None
+                        for sr in candidates:
+                            for ch in chan_candidates:
+                                try:
+                                    frames_per_buffer = int(sr * chunk_ms / 1000)
+                                    local_stream = self.pa.open(
+                                        format=FORMAT,
+                                        channels=ch,
+                                        rate=sr,
+                                        input=True,
+                                        frames_per_buffer=frames_per_buffer,
+                                        input_device_index=self.device_index,
+                                    )
+                                    picked_sr = sr
+                                    picked_ch = ch
+                                    break  # success
+                                except Exception as e:
+                                    last_err = e
+                                    local_stream = None
+                            if local_stream:
+                                break
+
+                        if not local_stream:
+                            raise OSError(f"Could not open device {self.device_index} with any of: "
+                                          f"rates={candidates}, channels={chan_candidates} (last error: {last_err})")
+
+                        # Commit chosen params
+                        self.sample_rate = int(picked_sr)
+                        self.channels = int(picked_ch)
                         self.chunk_size = int(self.sample_rate * chunk_ms / 1000)
 
-                        local_stream = self.pa.open(
-                            format=FORMAT, channels=self.channels, rate=self.sample_rate,
-                            input=True, frames_per_buffer=self.chunk_size, input_device_index=self.device_index
-                        )
                     except Exception:
                         log.exception(f"Error opening stream on index {self.device_index}")
                         local_stream = None
@@ -1262,14 +1305,18 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                                         pass
                         finally:
                             open_done.set()
+
                 t = Thread(target=try_open, name="OpenStream", daemon=True)
                 t.start()
-                open_done.wait(timeout=5)
+                open_done.wait(timeout=8)
+
                 with self.stream_lock:
                     if not self.stream or not self.stream.is_active():
                         self.stream = None
                         return False
-                self._log_ui(f"Audio: opened device index {self.device_index} @ {self.sample_rate} Hz, channels={self.channels}")
+
+                self._log_ui(f"Audio: opened device index {self.device_index} @ {self.sample_rate} Hz, "
+                             f"channels={self.channels}, chunk={self.chunk_size} frames (~20 ms)")
                 return True
         except Exception:
             log.exception("Stream Open Error")
@@ -1334,7 +1381,17 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 if len(mono_data) not in (480, 960, 1440, 1600):
                     continue
                 try:
-                    is_speech = self.vad.is_speech(mono_data.tobytes(), getattr(self, "sample_rate", 16000))
+
+                    vad_sr = self.sample_rate
+                    if vad_sr not in (8000, 16000, 32000, 48000):
+                        # downsample just for VAD decision
+                        vad_sr = 16000
+                        vad_bytes = _resample_i16_for_vad(mono_data, self.sample_rate, vad_sr)
+                    else:
+                        vad_bytes = mono_data.tobytes()
+
+                    is_speech = self.vad.is_speech(vad_bytes, vad_sr)
+
                 except Exception:
                     continue
 
