@@ -413,6 +413,25 @@ def resample_to_16k(x: np.ndarray, sr: int) -> np.ndarray:
     y = np.interp(t_new, t_old, x.astype(np.float64, copy=False))
     return y.astype(np.float32, copy=False)
 
+def _resample_i16_for_vad(mono_i16: np.ndarray, src_sr: int, dst_sr: int = 16000) -> bytes:
+    """
+    Cheap linear resample int16 -> int16 for short VAD frames.
+    Returns bytes suitable for webrtcvad (10/20/30 ms @ 8k/16k/32k/48k).
+    """
+    if src_sr == dst_sr:
+        return mono_i16.tobytes()
+    # normalize to float
+    x = mono_i16.astype(np.float32) / 32768.0
+    dur = x.size / float(src_sr)
+    if dur <= 0.0:
+        return b""
+    n_new = max(1, int(round(dur * dst_sr)))
+    t_old = np.linspace(0.0, dur, num=x.size, endpoint=False)
+    t_new = np.linspace(0.0, dur, num=n_new, endpoint=False)
+    y = np.interp(t_new, t_old, x)
+    y16 = np.clip(np.round(y * 32768.0), -32768, 32767).astype(np.int16)
+    return y16.tobytes()
+
 # Force Selector event loop on Windows to avoid frozen-app asyncio issues.
 import asyncio
 if sys.platform.startswith("win"):
@@ -1287,7 +1306,9 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         # Commit chosen params
                         self.sample_rate = int(picked_sr)
                         self.channels = int(picked_ch)
-                        self.chunk_size = int(self.sample_rate * chunk_ms / 1000)
+                        # 30 ms chunks (rounded) so WASAPI 44.1k becomes 1323 (not truncated)
+                        self.chunk_size = int(round(self.sample_rate * CHUNK_DURATION_MS / 1000.0))
+                        self.chunk_size = max(1, self.chunk_size)
 
                     except Exception:
                         log.exception(f"Error opening stream on index {self.device_index}")
@@ -1329,14 +1350,21 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         if not local_stream or not local_stream.is_active():
             self._log_ui("Audio: no valid stream on entry; exiting loop.")
             return
+
         consecutive_empty_reads = 0
         MAX_EMPTY_READS = 10
+
+        # VAD expects 10/20/30 ms at 8/16/32/48 kHz. We'll feed it 30 ms @ 16 kHz.
+        VAD_SR = 16000
+        VAD_SAMPLES_30MS = int(VAD_SR * 0.03)  # 480 samples
+
         try:
             while not self.stop_event.is_set():
                 with self.stream_lock:
                     local_stream = self.stream
                 if not local_stream or not local_stream.is_active():
                     break
+
                 try:
                     data = local_stream.read(self.chunk_size, exception_on_overflow=False)
                     if not data:
@@ -1348,9 +1376,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         consecutive_empty_reads = 0
                 except Exception:
                     break
+
                 if self.stop_event.is_set():
                     break
 
+                # ---- write WAV if recording ----
                 if self.recording and self.wav_writer:
                     try:
                         ww = self.wav_writer
@@ -1373,27 +1403,43 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         self.btn_start_rec.setEnabled(True)
                         self.btn_stop_rec.setEnabled(False)
 
-                int_data = np.frombuffer(data, dtype=np.int16)
-                expected = self.chunk_size * (getattr(self, "channels", 1))
-                if len(int_data) != expected:
-                    continue
-                mono_data = int_data[::getattr(self, "channels", 1)]
-                if len(mono_data) not in (480, 960, 1440, 1600):
-                    continue
+                # ---- prepare mono int16 for VAD ----
                 try:
-
-                    vad_sr = self.sample_rate
-                    if vad_sr not in (8000, 16000, 32000, 48000):
-                        # downsample just for VAD decision
-                        vad_sr = 16000
-                        vad_bytes = _resample_i16_for_vad(mono_data, self.sample_rate, vad_sr)
+                    int_data = np.frombuffer(data, dtype=np.int16)
+                    ch = max(1, getattr(self, "channels", 1))
+                    if int_data.size == 0 or (int_data.size % ch) != 0:
+                        # bad frame size; skip quietly
+                        continue
+                    if ch > 1:
+                        # average to mono, keep int16 range
+                        mono = int_data.reshape(-1, ch).mean(axis=1).astype(np.int16)
                     else:
-                        vad_bytes = mono_data.tobytes()
-
-                    is_speech = self.vad.is_speech(vad_bytes, vad_sr)
-
+                        mono = int_data
                 except Exception:
                     continue
+
+                # ---- VAD on 30 ms @ 16k (resample if needed) ----
+                try:
+                    # create a 30 ms window for VAD (use the last 30 ms worth after resample)
+                    vad_buf = _resample_i16_for_vad(mono, getattr(self, "sample_rate", 16000), VAD_SR)
+                    if not vad_buf:
+                        continue
+                    # bytes -> int16 view to slice last 30 ms exactly
+                    vad_i16 = np.frombuffer(vad_buf, dtype=np.int16)
+                    if vad_i16.size < VAD_SAMPLES_30MS:
+                        # too small; accumulate via buffer (still push to transcription buffer below)
+                        is_speech = False
+                    else:
+                        # take last 30 ms
+                        vad_window = vad_i16[-VAD_SAMPLES_30MS:]
+                        is_speech = self.vad.is_speech(vad_window.tobytes(), VAD_SR)
+                except Exception:
+                    # if VAD fails, fall back to "not speech" but still allow buffering
+                    is_speech = False
+
+                # ---- Buffer raw device data for later transcription regardless; VAD gates pacing/UI only ----
+                with self.buffer_lock:
+                    self.buffer.append(data)
 
                 if is_speech:
                     QtCore.QMetaObject.invokeMethod(
@@ -1401,12 +1447,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Listening...")
                     )
                     self.was_speech = True
-                    with self.buffer_lock:
-                        self.buffer.append(data)
                     now = time.time()
                     if len(self.buffer) >= self.buffer.maxlen - 1 or (now - self.last_transcription_time) > self.force_transcription_interval:
                         self._try_schedule_transcription()
                 else:
+                    # transition to silence ⇒ flush what we have if it's sizable
                     if self.was_speech:
                         self.was_speech = False
                         QtCore.QMetaObject.invokeMethod(
@@ -1417,6 +1462,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                             enough = len(self.buffer) >= POOL_CHUNKS
                         if enough:
                             self._try_schedule_transcription()
+
                 time.sleep(0.003)
         finally:
             self._log_ui("Audio: loop exiting"); safe_flush()
