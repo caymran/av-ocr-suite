@@ -1,5 +1,8 @@
 name: Windows Build
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
@@ -244,11 +247,19 @@ jobs:
     needs: build
     runs-on: windows-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: out
+
+      - name: List downloaded files (debug)
+        shell: pwsh
+        run: |
+          Write-Host "Tree under out/:"
+          Get-ChildItem -Recurse -Force out | ForEach-Object { $_.FullName }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -256,11 +267,14 @@ jobs:
           name: AV + OCR Suite ${{ github.ref_name }}
           body: |
             Automated Windows release for ${{ github.ref_name }}.
-            Includes bundled Whisper base.en (if cached), ffmpeg, and Tesseract.
+           Includes bundled Whisper base.en (if cached), ffmpeg, and Tesseract.
           files: |
-            out/AV_OCR_Suite-setup/**/*.exe
-            out/AV_OCR_Suite-setup/**/*.sha256
-            out/AV_OCR_Suite-dist/AV_OCR_Suite/AV_OCR_Suite.exe
-            out/AV_OCR_Suite-dist/AV_OCR_Suite/AV_OCR_Suite.exe.sha256
+            out/**/Output/**/*.exe
+            out/**/Output/**/*.sha256
+            out/**/AV_OCR_Suite/**/*.exe
+            out/**/AV_OCR_Suite/**/*.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
