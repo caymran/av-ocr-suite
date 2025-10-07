@@ -371,11 +371,15 @@ def export_archive_build_video(frames_with_ts, wav_path=None, crf=28, output_pat
     ]
     if wav_path:
         cmd += ["-i", str(wav_path)]
-    # Still-image tuning to avoid re-encoding weirdness
+
+    # 🔧 Ensure even dimensions + proper colorspace/SAR
+    vf = "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p,setsar=1"
+
     cmd += [
-        "-r", "25",                # playback fps
-        "-pix_fmt", "yuv420p",
+        "-vf", vf,            # <— add this line
+        "-r", "25",
         "-c:v", "libx264", "-crf", str(int(crf)),
+        "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
     ]
     if wav_path:
