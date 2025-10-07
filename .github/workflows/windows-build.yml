@@ -118,7 +118,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           $dist = "dist\AV_OCR_Suite"
-          if (-not (Test-Path $dist)) { Write-Error "PyInstaller output not found"; exit 1 }
+          if (-not (Test-Path $dist)) { throw "PyInstaller output not found: $dist" }
 
           # ---- ffmpeg: copy REAL binaries (avoid choco shims) ----
           $ffSrcCandidates = @(
@@ -126,18 +126,17 @@ jobs:
             "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin64"  # older choco
           ) | Where-Object { Test-Path $_ }
 
-          if ($ffSrcCandidates.Count -gt 0) {
-            $ffSrc = $ffSrcCandidates[0]
+          if ($ffSrcCandidates) {
+            $ffSrc = $ffSrcCandidates | Select-Object -First 1   # <-- no [0] indexing on a string
             $ffDst = Join-Path $dist "ffmpeg"
             New-Item -ItemType Directory -Force -Path $ffDst | Out-Null
             Write-Host "Copying ffmpeg from: $ffSrc -> $ffDst"
-            # IMPORTANT: avoid Join-Path for '*' with absolute source
             Copy-Item -Path "$ffSrc\*" -Destination $ffDst -Recurse -Force
           } else {
             Write-Warning "ffmpeg binaries not found in Chocolatey lib; continuing without bundling."
           }
 
-          # ---- Tesseract: copy actual install dir (not shim) ----
+          # ---- Tesseract: discover and copy ----
           $tessSrc = @(
             (Get-Command tesseract.exe -ErrorAction SilentlyContinue | ForEach-Object { Split-Path $_.Source -Parent }),
             "C:\Program Files\Tesseract-OCR",
@@ -152,7 +151,6 @@ jobs:
           } else {
             Write-Warning "Tesseract not found; continuing without bundling."
           }
-
 
           # ---- Tesseract: discover and copy ----
           $tessExe = (Get-Command tesseract.exe -ErrorAction SilentlyContinue).Source
