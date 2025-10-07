@@ -148,8 +148,11 @@ STAMP = APP_START.strftime("%Y%m%d_%H%M%S")
 
 SCRIPT_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) if getattr(sys, "frozen", False) \
     else Path(__file__).resolve().parent
-CWD = Path.cwd()
 
+# Where the executable lives when frozen; else the script dir
+EXE_DIR = Path(getattr(sys, "frozen", False) and sys.executable or __file__).resolve().parent
+
+CWD = Path.cwd()
 ROOT_LOGS = CWD / "logs"
 ROOT_ARCHIVES = CWD / "archives"
 RUN_DIR = ROOT_ARCHIVES / STAMP
@@ -165,17 +168,30 @@ def _frozen_base_dir() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 def _enable_tesseract_if_present():
-    """Wire up pytesseract if Tesseract is installed or bundled."""
+    """Wire up pytesseract if Tesseract is installed or bundled, and add its dir to PATH."""
     try:
         import pytesseract
         from shutil import which
+
+        # 1) PATH
         tcmd = which("tesseract")
+
+        # 2) Bundled locations
+        candidates = [
+            EXE_DIR / "tesseract" / "tesseract.exe",
+            CWD / "tesseract" / "tesseract.exe",
+            Path(os.getenv("LOCALAPPDATA", "")) / "AV_OCR_Suite" / "tesseract" / "tesseract.exe",
+        ]
         if not tcmd:
-            base = Path(getattr(sys, "_MEIPASS", SCRIPT_DIR))
-            cand = base / "tesseract" / "tesseract.exe"
-            if cand.exists():
-                tcmd = str(cand)
+            for c in candidates:
+                if c and c.exists():
+                    tcmd = str(c)
+                    break
+
         if tcmd:
+            tdir = str(Path(tcmd).parent)
+            # Prepend so our bundled copy wins
+            os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
             pytesseract.pytesseract.tesseract_cmd = tcmd
             global USE_TESS
             USE_TESS = True
@@ -389,6 +405,24 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
+
+def _ensure_ffmpeg_on_path():
+    """Ensure bundled ffmpeg folder is added to PATH if ffmpeg isn't already found."""
+    import shutil
+    if shutil.which("ffmpeg"):
+        return
+    candidates = [
+        EXE_DIR / "ffmpeg",
+        CWD / "ffmpeg",
+        Path(os.getenv("LOCALAPPDATA", "")) / "AV_OCR_Suite" / "ffmpeg",
+    ]
+    for d in candidates:
+        if d.exists() and (d / "ffmpeg.exe").exists():
+            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+            log.info(f"ffmpeg enabled from: {d}")
+            return
+    log.info("ffmpeg not found on PATH and no bundled copy detected.")
+
 
 # ======================
 #   OCR helpers + Win32 capture
@@ -1148,8 +1182,17 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             return
         if self.audio_thread is not None and self.audio_thread.is_alive():
             return
+
         def stream_and_start():
             try:
+                # NEW: Skip if no input device
+                if self.device_index is None:
+                    self.status_label.setText("Status: No input device. Choose '📁 Load Audio/Video File…' or attach a device.")
+                    self.device_combo.setEnabled(True)
+                    self.copy_button.setEnabled(bool(self.transcript_lines))
+                    self._log_ui("Audio: no input device; idle. Use file input or attach a mic/loopback device.")
+                    return
+
                 time.sleep(0.2)
                 ok = self.open_stream()
                 if not ok:
@@ -1168,6 +1211,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, stream_and_start)
 
     def open_stream(self):
+        if self.device_index is None:
+            return False
         try:
             with self.opening_lock:
                 self.open_gen += 1
@@ -2126,6 +2171,7 @@ if __name__ == "__main__":
 
         # call it:
         _enable_tesseract_if_present()
+        _ensure_ffmpeg_on_path()
         log_ffmpeg_info_once()
 
         # set default application icon early
