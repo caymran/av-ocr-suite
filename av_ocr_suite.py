@@ -2308,22 +2308,45 @@ if __name__ == "__main__":
         log.info("Window shown; loading speech model in the background…"); safe_flush()
 
         # Background model loader thread (CTRANSLATE2 / faster-whisper)
+        from faster_whisper import WhisperModel
+
         def _load_model_bg():
             try:
-                from faster_whisper import WhisperModel
-                model_name = os.getenv("AVOS_WHISPER_MODEL", "base.en")
-                local_dir = (SCRIPT_DIR / "models" / model_name)
-                name_or_path = str(local_dir) if local_dir.exists() else model_name
+                # Prefer explicit override (folder or model name)
+                override = os.getenv("AVOS_WHISPER_MODEL", "").strip()
 
-                mdl = WhisperModel(
-                    name_or_path,
-                    device="cpu",
-                    compute_type=os.getenv("AVOS_COMPUTE", "int8"),
-                    cpu_threads=max(1, os.cpu_count() or 1),
-                    download_root=str(APP_CACHE),
-                    local_files_only=local_dir.exists() or bool(os.getenv("HF_HUB_OFFLINE"))
-                )
+                # Common local locations (packaged or user cache)
+                candidates = []
+                if override:
+                    candidates.append(Path(override))
+                candidates += [
+                    _frozen_base_dir() / "models" / "base.en",               # bundled with EXE
+                    Path.home() / "AppData/Local/AV_OCR_Suite/models/base.en" # per-user cache
+                ]
+
+                local_dir = next((p for p in candidates if p and p.exists()), None)
+
+                if local_dir:
+                    mdl = WhisperModel(
+                        str(local_dir),
+                        device="cpu",
+                        compute_type=os.getenv("AVOS_COMPUTE", "int8"),
+                        local_files_only=True,          # force offline when we have files
+                        download_root=str(APP_CACHE),
+                        cpu_threads=max(1, os.cpu_count() or 1),
+                    )
+                else:
+                    mdl = WhisperModel(
+                        os.getenv("AVOS_WHISPER_MODEL", "base.en"),
+                        device="cpu",
+                        compute_type=os.getenv("AVOS_COMPUTE", "int8"),
+                        local_files_only=False,         # allow online fetch if available
+                        download_root=str(APP_CACHE),
+                        cpu_threads=max(1, os.cpu_count() or 1),
+                    )
+
                 window.model_ready.emit(mdl)
+
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
 
@@ -2342,4 +2365,5 @@ if __name__ == "__main__":
             pass
 
         sys.exit(1)
+
 
