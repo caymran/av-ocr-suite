@@ -1175,8 +1175,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             if jabra_device is not None:
                 return jabra_device
             if speakers_device is not None:
-                return speakers_device            if remote_device is not None:
-                return remote_device            info = self.pa.get_default_input_device_info()
+                return speakers_device
+            if remote_device is not None:
+                return remote_device
+            info = self.pa.get_default_input_device_info()
             return info['index']
         except Exception:
             log.exception("Default Device Selection Error")
@@ -2310,15 +2312,18 @@ if __name__ == "__main__":
             try:
                 from faster_whisper import WhisperModel
                 model_name = os.getenv("AVOS_WHISPER_MODEL", "base.en")
+                local_dir = (SCRIPT_DIR / "models" / model_name)
+                name_or_path = str(local_dir) if local_dir.exists() else model_name
+
                 mdl = WhisperModel(
-                    model_name,
+                    name_or_path,
                     device="cpu",
                     compute_type=os.getenv("AVOS_COMPUTE", "int8"),
                     cpu_threads=max(1, os.cpu_count() or 1),
                     download_root=str(APP_CACHE),
-                    local_files_only=False,
+                    local_files_only=local_dir.exists() or bool(os.getenv("HF_HUB_OFFLINE"))
                 )
-                window.model_ready.emit(mdl)
+                    window.model_ready.emit(mdl)
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
 
@@ -2335,4 +2340,5 @@ if __name__ == "__main__":
             print("An error occurred. See logs folder.")
         except Exception:
             pass
+
         sys.exit(1)
