@@ -2323,7 +2323,7 @@ if __name__ == "__main__":
                     download_root=str(APP_CACHE),
                     local_files_only=local_dir.exists() or bool(os.getenv("HF_HUB_OFFLINE"))
                 )
-                    window.model_ready.emit(mdl)
+                window.model_ready.emit(mdl)
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
 
@@ -2342,3 +2342,4 @@ if __name__ == "__main__":
             pass
 
         sys.exit(1)
+
