@@ -1,4 +1,4 @@
-name: Mirror to GitLab
+name: Mirror to CSDE GitLab
 on:
   push:
     branches: ["**"]
@@ -9,8 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - name: Push --mirror to GitLab
+        with:
+          fetch-depth: 0
+
+      - name: Install CSDE CA for Git
+        run: |
+          # write the CA bundle to a file
+          cat > csde-ca.pem <<'PEM'
+${{ secrets.CSDE_CA_PEM }}
+PEM
+          # Use the CA bundle only for the CSDE GitLab host
+          git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem"
+
+      - name: Push --mirror to CSDE
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
