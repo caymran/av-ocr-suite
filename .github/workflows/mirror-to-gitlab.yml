@@ -12,19 +12,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Put your CSDE CA PEM into a GitHub secret named CSDE_CA_PEM
       - name: Install CSDE CA for Git
         env:
           CSDE_CA_PEM: ${{ secrets.CSDE_CA_PEM }}
         run: |
-          # write PEM exactly as stored in the secret
+          # Write the CA bundle (intermediates + root) to a file
           printf "%s" "$CSDE_CA_PEM" > csde-ca.pem
-          # tell git to trust this CA for your CSDE GitLab host only
-          git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem"
+
+          # Sanity check: show subjects in the bundle
+          awk 'BEGIN{c=0} /BEGIN CERT/{c++} {print > ("ca-" c ".pem")}' csde-ca.pem
+          for f in ca-*.pem; do
+            echo "----- $f -----"
+            openssl x509 -noout -subject -issuer -in "$f" || true
+          done
+
+          # Tell git to trust this CA bundle for your host
+          git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem
+
+      - name: Test TLS with CA (curl HEAD)
+        run: |
+          curl --head --silent --show-error --cacert csde-ca.pem https://gitlab.csde.nswc.navy.mil/ >/dev/null
+          echo "TLS verification to CSDE GitLab succeeded."
 
       - name: Push --mirror to CSDE
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
           git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
-          git push --mirror gitlab
+          GIT_CURL_VERBOSE=1 git push --mirror gitlab
