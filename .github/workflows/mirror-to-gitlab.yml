@@ -12,13 +12,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Put your CSDE CA PEM into a GitHub secret named CSDE_CA_PEM
       - name: Install CSDE CA for Git
+        env:
+          CSDE_CA_PEM: ${{ secrets.CSDE_CA_PEM }}
         run: |
-          # write the CA bundle to a file
-          cat > csde-ca.pem <<'PEM'
-${{ secrets.CSDE_CA_PEM }}
-PEM
-          # Use the CA bundle only for the CSDE GitLab host
+          # write PEM exactly as stored in the secret
+          printf "%s" "$CSDE_CA_PEM" > csde-ca.pem
+          # tell git to trust this CA for your CSDE GitLab host only
           git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem"
 
       - name: Push --mirror to CSDE
