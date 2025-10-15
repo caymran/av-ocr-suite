@@ -12,24 +12,37 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Put the full CA chain (intermediate(s) + root) in secret CSDE_CA_PEM.
+      # If your export also included the leaf (CN=csde.nswc.navy.mil), this step drops it.
       - name: Install CSDE CA for Git
         env:
           CSDE_CA_PEM: ${{ secrets.CSDE_CA_PEM }}
         run: |
-          # Write the CA bundle (intermediates + root) to a file
-          printf "%s" "$CSDE_CA_PEM" > csde-ca.pem
+          # Write the provided PEM bundle
+          printf "%s" "$CSDE_CA_PEM" > ca-all.pem
 
-          # Sanity check: show subjects in the bundle
-          awk 'BEGIN{c=0} /BEGIN CERT/{c++} {print > ("ca-" c ".pem")}' csde-ca.pem
-          for f in ca-*.pem; do
+          # Split into individual files part-1.pem, part-2.pem, ...
+          awk 'BEGIN{n=0} /BEGIN CERTIFICATE/{n++} {print > ("part-" n ".pem")}' ca-all.pem
+
+          # Build a cleaned CA bundle (exclude the leaf cert with CN=csde.nswc.navy.mil)
+          : > csde-ca.pem
+          for f in part-*.pem; do
+            sub=$(openssl x509 -noout -subject -in "$f" || true)
+            iss=$(openssl x509 -noout -issuer  -in "$f" || true)
             echo "----- $f -----"
-            openssl x509 -noout -subject -issuer -in "$f" || true
+            echo "$sub"
+            echo "$iss"
+            if echo "$sub" | grep -qi "CN *= *csde\.nswc\.navy\.mil"; then
+              echo "Skipping leaf/server cert: $f"
+            else
+              cat "$f" >> csde-ca.pem
+            fi
           done
 
-          # Tell git to trust this CA bundle for your host
-          git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem
+          # Tell git to trust this CA bundle for your GitLab host (fixed closing quote)
+          git config --global http."https://gitlab.csde.nswc.navy.mil/".sslCAInfo "$PWD/csde-ca.pem"
 
-      - name: Test TLS with CA (curl HEAD)
+      - name: Test TLS to CSDE GitLab with CA bundle
         run: |
           curl --head --silent --show-error --cacert csde-ca.pem https://gitlab.csde.nswc.navy.mil/ >/dev/null
           echo "TLS verification to CSDE GitLab succeeded."
