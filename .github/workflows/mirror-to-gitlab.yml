@@ -1,5 +1,6 @@
 name: Mirror to CSDE GitLab
 on:
+  workflow_dispatch:   # ✅ allows manual runs
   push:
     branches: ["**"]
     tags: ["**"]
