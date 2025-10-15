@@ -48,9 +48,15 @@ jobs:
           curl --head --silent --show-error --cacert csde-ca.pem https://gitlab.csde.nswc.navy.mil/ >/dev/null
           echo "TLS verification to CSDE GitLab succeeded."
 
-      - name: Push --mirror to CSDE
+      - name: Push branches and tags to CSDE
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
           git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
-          GIT_CURL_VERBOSE=1 git push --mirror gitlab
+
+          # Push all branches, prune deleted ones, and force to keep GitLab in sync
+          git push --force --prune gitlab "refs/heads/*:refs/heads/*"
+
+          # Push all tags (use explicit refspec so pruning applies to tags too)
+          git push --force --prune gitlab "refs/tags/*:refs/tags/*"
+
