@@ -198,6 +198,8 @@ def _enable_tesseract_if_present():
             log.info(f"Tesseract enabled: {tcmd}")
         else:
             log.info("Tesseract not found; OCR disabled.")
+            log.info(f"Tesseract search: PATH which()={tcmd!s}")
+            log.info(f"Tesseract candidates: {candidates}")
     except Exception:
         log.exception("Failed to initialize Tesseract; OCR disabled.")
 
@@ -259,19 +261,34 @@ DEFAULT_PROMPT = (
 # ======================
 def setup_logging():
     logger = logging.getLogger("transcriber")
-    logger.setLevel(logging.INFO)
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    logger.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s")
+
     if sys.stdout:
         console = logging.StreamHandler(sys.stdout)
-        console.setLevel(logging.INFO)
-        console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        console.setLevel(level)
+        console.setFormatter(fmt)
         logger.addHandler(console)
+
     logfile = ROOT_LOGS / f"app_{STAMP}.log"
     fh = logging.FileHandler(logfile, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
+
     logger.info(f"Application log: {logfile}")
+    logger.info(f"Run stamp={STAMP} cwd={CWD}")
+    logger.info(f"Debug mode={DEBUG_MODE}")
+
+    # catch unhandled exceptions
+    def _excepthook(exctype, value, tb):
+        logger.exception("UNCAUGHT", exc_info=(exctype, value, tb))
+    sys.excepthook = _excepthook
+
     return logger
+
 
 log = setup_logging()
 
@@ -1151,14 +1168,16 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             for ch in ch_candidates:
                 try:
                     fpb = int(sr * self.chunk_ms / 1000.0)
+                    self._log_ui(f"Audio[{label}]: trying open @ sr={sr} ch={ch} fpb={fpb} (index={dev['index']})")
                     s = self.pa.open(
                         format=FORMAT, channels=ch, rate=sr,
                         input=True, frames_per_buffer=fpb,
                         input_device_index=dev["index"]
                     )
-                    self._log_ui(f"Audio[{label}]: opened @ {sr} Hz, ch={ch}, fpb={fpb}")
+                    self._log_ui(f"Audio[{label}]: OPENED index={dev['index']} @ {sr}Hz ch={ch} fpb={fpb}")
                     return {"stream": s, "sr": sr, "ch": ch, "fpb": fpb}
                 except Exception as e:
+                    self._log_ui(f"Audio[{label}]: open failed @ sr={sr} ch={ch} fpb={fpb} → {type(e).__name__}: {e}")
                     last_err = e
         self._log_ui(f"Audio[{label}]: failed to open (last error: {last_err})")
         return None
@@ -1181,6 +1200,9 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         self.stream_spk = spk_state["stream"] if spk_state else None
                         self.mic_open = mic_state or {}
                         self.spk_open = spk_state or {}
+                        self._log_ui(f"Audio: mic_open={bool(self.stream_mic)} {self.mic_open!r}")
+                        self._log_ui(f"Audio: spk_open={bool(self.stream_spk)} {self.spk_open!r}")
+
 
                 if not self.stream_mic and not self.stream_spk:
                     self.status_label.setText("Status: No input streams. Pick Mic and/or Speaker.")
@@ -1270,6 +1292,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
             self.audio_thread.start()
             self.status_label.setText("Status: Device(s) switched.")
+            with self.stream_lock:
+                sm = bool(self.stream_mic and self.stream_mic.is_active())
+                ss = bool(self.stream_spk and self.stream_spk.is_active())
+            self._log_ui(f"Switch: streams active → MIC={sm} SPK={ss}")
+
         except Exception:
             log.exception("Device switch failed")
             self.status_label.setText("Status: Device switch failed (see log).")
@@ -1283,6 +1310,20 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self._log_ui("Audio: loop entered (dual-source)")
         VAD_SR = 16000
         VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
+
+        def safe_read(stream, want_frames):
+            try:
+                avail = stream.get_read_available()
+                if avail is None:
+                    # some hosts return None; fall back to small non-blocking chunk
+                    avail = 0
+                # read if we have at least half of what we want; cap to available
+                n = min(avail, want_frames) if avail >= (want_frames // 2) else 0
+                if n > 0:
+                    return stream.read(n, exception_on_overflow=False)
+                return None
+            except Exception:
+                return None
 
         def to_mono_i16(raw, ch):
             if not raw:
@@ -1312,9 +1353,40 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         m_state = dict(getattr(self, "mic_open", {}) or {})
         s_state = dict(getattr(self, "spk_open", {}) or {})
 
-        # frames-per-buffer per device
+        self._log_ui(f"Audio cfg: MIC sr={m_state.get('sr')} ch={m_state.get('ch')} fpb={m_state.get('fpb')}; "
+                     f"SPK sr={s_state.get('sr')} ch={s_state.get('ch')} fpb={s_state.get('fpb')}")
+
         m_fpb = int(m_state.get("fpb", 0) or 0)
         s_fpb = int(s_state.get("fpb", 0) or 0)
+
+        # -------------------------------------
+        with self.stream_lock:
+            if self.stream_mic and not self.stream_mic.is_active():
+                try:
+                    self.stream_mic.start_stream()
+                    self._log_ui("Audio[MIC]: stream started manually")
+                except Exception:
+                    self._log_ui("Audio[MIC]: failed to start stream")
+
+            if self.stream_spk and not self.stream_spk.is_active():
+                try:
+                    self.stream_spk.start_stream()
+                except Exception:
+                    self._log_ui("Audio[SPK]: failed to start stream")
+            # -------------------------------------
+            sm_active = bool(self.stream_mic and self.stream_mic.is_active())
+            ss_active = bool(self.stream_spk and self.stream_spk.is_active())
+            self._log_ui(f"Audio: post-start active → MIC={sm_active} SPK={ss_active}")
+            
+            mic_block = safe_read(s_m, m_fpb) if (s_m and m_fpb > 0) else None
+            spk_block = safe_read(s_s, s_fpb) if (s_s and s_fpb > 0) else None
+       
+            try:
+                m_av = s_m.get_read_available() if s_m else None
+                s_av = s_s.get_read_available() if s_s else None
+                self._log_ui(f"Audio: initial read_available → MIC={m_av} SPK={s_av}")
+            except Exception as e:
+                self._log_ui(f"Audio: initial read_available error: {e}")
 
         while not self.stop_event.is_set():
             # Pull a block from each *if available*
@@ -1329,15 +1401,19 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 if s_m and s_m.is_active() and m_fpb > 0:
                     mic_block = s_m.read(m_fpb, exception_on_overflow=False)
                     self.mic_bytes_total += len(mic_block or b"")
-            except Exception:
+            except Exception as e:
+                self._log_ui(f"Audio[MIC]: read error → {type(e).__name__}: {e}")
                 mic_block = None
+
 
             try:
                 if s_s and s_s.is_active() and s_fpb > 0:
                     spk_block = s_s.read(s_fpb, exception_on_overflow=False)
                     self.spk_bytes_total += len(spk_block or b"")
-            except Exception:
+            except Exception as e:
+                self._log_ui(f"Audio[SPK]: read error → {type(e).__name__}: {e}")
                 spk_block = None
+
 
             # Convert to mono i16
             mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
@@ -1375,6 +1451,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                              f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
                 self.last_meter_log = now
 
+
             # Per-source VAD (use last 30ms of each if present)
             def vad_last30(xf):
                 if xf is None or xf.size < VAD_SAMPLES_30MS:
@@ -1386,8 +1463,29 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 except Exception:
                     return False
 
+            now = time.time()
+            if not hasattr(self, "_last_buf_log"):
+                self._last_buf_log = 0.0
+            if now - self._last_buf_log > 5.0:
+                with self.buffer_lock:
+                    mb = sum(len(b) for b in self.buffer_mic)
+                    sb = sum(len(b) for b in self.buffer_spk)
+                    mm = sum(len(b) for b in self.buffer)
+                # 2 bytes/sample @ 16k
+                def b2ms(n): return (n / (2*16000.0)) * 1000.0
+                self._log_ui(f"Buf: MIC={mb}B ({b2ms(mb):.0f}ms) SPK={sb}B ({b2ms(sb):.0f}ms) MIX={mm}B ({b2ms(mm):.0f}ms)")
+                self._last_buf_log = now
+
             mic_speech = vad_last30(mic_f)
             spk_speech = vad_last30(spk_f)
+
+            if mic_speech or spk_speech:
+                self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
+
+            if mic_f is not None or spk_f is not None:
+                db_m = rms_db(mic_f) if mic_f is not None else -120.0
+                db_s = rms_db(spk_f) if spk_f is not None else -120.0
+                self._log_ui(f"VAD detail: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS")
 
             # Build the mixed float32 16k chunk (align lengths)
             mix = None
@@ -1403,10 +1501,23 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 mix = self.mix_spk_gain * spk_f
 
             # Append mixed audio to the transcription buffer in raw int16 (16k)
+            i16 = b""  # <— initialize so it's always defined
             if mix is not None and mix.size:
                 i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
                 with self.buffer_lock:
                     self.buffer.append(i16)
+                    
+            # --- write to the merged WAV on disk (16k mono) ---
+            try:
+                if self.wav_writer:
+                    self.wav_writer.writeframes(i16)
+                    self.samples_written += len(i16) // 2  # int16 samples
+                    # log every ~5s of written audio
+                    if (time.time() - getattr(self, "_last_wav_log", 0)) > 5.0:
+                        self._log_ui(f"WAV: samples_written={self.samples_written} (~{self.samples_written/16000.0:.1f}s)")
+                        self._last_wav_log = time.time()
+            except Exception as e:
+                self._log_ui(f"WAV write error → {type(e).__name__}: {e}")
 
             # UI + scheduling
             if mic_speech or spk_speech:
@@ -1417,6 +1528,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 self.was_speech = True
                 # trigger immediately when either talks
                 self._try_schedule_transcription()
+                self._log_ui("Transcribe scheduled: VAD activity")
                 # Hint for tagging (which source spoke last)
                 if mic_speech:
                     self.transcription_hints.append("[MIC]")
@@ -1434,27 +1546,43 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     with self.buffer_lock:
                         if len(self.buffer) > 0:
                             self._try_schedule_transcription()
+                            self._log_ui("Transcribe scheduled: Force due to duration of audio")
 
             time.sleep(0.002)
 
     # ----------------- Transcription -----------------
     def _try_schedule_transcription(self):
         if self.suspend_transcription.is_set():
+            self._log_ui("Transcribe not scheduled: suspended")
             return
-        if self.transcription_in_progress.is_set() or self.transcription_scheduled.is_set():
+        if self.transcription_in_progress.is_set():
+            self._log_ui("Transcribe not scheduled: already in progress")
             return
-        # quick size gate
+        if self.transcription_scheduled.is_set():
+            self._log_ui("Transcribe not scheduled: already scheduled")
+            return
         with self.buffer_lock:
-            size_now = len(b"".join(self.buffer)) + len(b"".join(self.buffer_mic)) + len(b"".join(self.buffer_spk))
-        if size_now < 9600:  # ~0.3s @ 16k mono
+            total_now = (len(b"".join(self.buffer)) +
+                         len(b"".join(self.buffer_mic)) +
+                         len(b"".join(self.buffer_spk)))
+        if total_now < 9600:
+            self._log_ui(f"Transcribe not scheduled: total_buf={total_now}B (<9600B)")
             return
+        self._log_ui(f"Transcribe scheduled: total_buf={total_now}B")
         self.transcription_scheduled.set()
-        def run():
-            try:
-                self.transcribe_buffer()
-            finally:
-                self.transcription_scheduled.clear()
-        Thread(target=run, name="TranscribeBuffer", daemon=True).start()
+        Thread(target=lambda: (self.transcribe_buffer(), self.transcription_scheduled.clear()),
+               name="TranscribeBuffer", daemon=True).start()
+
+    def check_force_transcription(self):
+        if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
+            return
+        with self.buffer_lock:
+            have_any = (len(self.buffer) > 0 or len(self.buffer_mic) > 0 or len(self.buffer_spk) > 0)
+        if not have_any:
+            return
+        if (time.time() - self.last_transcription_time) > self.force_transcription_interval:
+            self._log_ui("Transcribe scheduled: force timer")
+            self._try_schedule_transcription()
 
     @contextmanager
     def transcription_guard(self):
@@ -1463,17 +1591,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             yield
         finally:
             self.transcription_in_progress.clear()
-
-    def check_force_transcription(self):
-        if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
-            return
-        with self.buffer_lock:
-            buf_has_data = len(self.buffer) > 0
-        if not buf_has_data:
-            return
-        now = time.time()
-        if (now - self.last_transcription_time) > self.force_transcription_interval:
-            self._try_schedule_transcription()
 
     def transcribe_buffer(self):
         with self.transcription_guard():
@@ -1489,6 +1606,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 merged_bytes = b"".join(self.buffer)
                 mic_bytes    = b"".join(self.buffer_mic)
                 spk_bytes    = b"".join(self.buffer_spk)
+                self._log_ui(f"Tbuf: merged={len(merged_bytes)}B mic={len(mic_bytes)}B spk={len(spk_bytes)}B")
 
             # Require at least ~0.3s of audio in any stream before processing
             # 16 kHz * 0.3 s * 2 bytes ≈ 9600 bytes
@@ -1510,29 +1628,52 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             mic_f32_16k    = i16_bytes_to_f32_16k(mic_bytes,    16000) if mic_bytes    else np.zeros(0, np.float32)
             spk_f32_16k    = i16_bytes_to_f32_16k(spk_bytes,    16000) if spk_bytes    else np.zeros(0, np.float32)
 
+            def dur(x): return f"{(x.size/16000.0):.2f}s" if x is not None else "0.00s"
+            self._log_ui(f"Tbuf dur: MRG={dur(merged_f32_16k)} MIC={dur(mic_f32_16k)} SPK={dur(spk_f32_16k)}")
+
             try:
                 # Prefer true per-source transcription when available
                 if mic_f32_16k.size >= 1600 and spk_f32_16k.size >= 1600:
+                    self._log_ui("Transcribe route: per-source MIC+SPK")
+                    t0 = time.perf_counter()
                     mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
                     spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
                     lines = interleave_tagged_segments(mic_segs, spk_segs)
+                    dt = (time.perf_counter() - t0) * 1000.0
+                    self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
                     if not lines and merged_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: MERGED MIC+SPK")
+                        t0 = time.perf_counter()
                         m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
                         lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
                 else:
                     # Single-source fallbacks with explicit tags
                     if mic_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: MIC only")
+                        t0 = time.perf_counter()
                         mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
                         lines = [f"[MIC] {seg.text.strip()}" for seg in mic_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
                     elif spk_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: SPK only")
+                        t0 = time.perf_counter()
                         spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
                         lines = [f"[SPK] {seg.text.strip()}" for seg in spk_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
                     else:
                         if merged_f32_16k.size < 1600:
                             self._log_ui("Transcribe skip: insufficient audio.")
                             return
+                        self._log_ui("Transcribe route: MERGED Buffer")
+                        t0 = time.perf_counter()
                         m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
                         lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
 
                 if lines:
                     ts = datetime.now().strftime("%H:%M:%S")
@@ -1843,14 +1984,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def flush_pending_transcription(self):
         """Force a last transcription pass if there’s buffered audio."""
-        if self.transcription_in_progress.is_set():
-            return
-        with self.buffer_lock:
-            has = len(self.buffer) > 0
-        if has:
-            self._try_schedule_transcription()
-            # Optional: brief wait so the background thread can finish a small chunk
+        try:
+            self.audio_tab.check_force_transcription()
+            # Give the background thread a moment if it was just scheduled
             time.sleep(0.2)
+        except Exception:
+            logging.getLogger("transcriber").exception("MainWindow.flush_pending_transcription failed")
 
     def _build_loading_banner(self):
         bar = QtWidgets.QFrame()
@@ -1897,7 +2036,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.last_audio_path = str(TEMP_WAV)
 
             try:
-                self.audio_tab.flush_pending_transcription()
+                self.flush_pending_transcription()
             except Exception:
                 logging.getLogger("transcriber").exception("force: flush failed")
 
@@ -2022,6 +2161,11 @@ class MainWindow(QtWidgets.QMainWindow):
             n_frames = len(self.session_frames)
             self._append_log(f"[export] frames={n_frames} wav={wav_path!s}")
 
+            if n_frames:
+                t0 = self.session_frames[0][1]
+                t1 = self.session_frames[-1][1]
+                self._append_log(f"[export] frame time span: {t0:.3f}s → {t1:.3f}s (Δ={(t1 - t0):.3f}s)")
+
             def wav_ok(p: str | Path, min_bytes: int = 1024) -> bool:
                 try:
                     pp = Path(p) if p else None
@@ -2121,6 +2265,7 @@ class MainWindow(QtWidgets.QMainWindow):
             event.accept(); return
         self._closing = True
         self._append_log("Close event triggered.")
+        self._append_log(f"[shutdown] last_audio_path={self.last_audio_path} frames={len(self.session_frames)}")
 
         try:
             # 1) Stop ongoing capture ASAP so WAV is final
@@ -2135,7 +2280,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # 2) FLUSH + EXPORT *BEFORE* tearing down PyAudio
             self._append_log("[shutdown] flushing any pending transcription…")
             try:
-                self.audio_tab.flush_pending_transcription()
+                self.flush_pending_transcription()
             except Exception:
                 logging.getLogger("transcriber").exception("Flush pending transcription failed")
 
@@ -2174,12 +2319,14 @@ class MainWindow(QtWidgets.QMainWindow):
 import atexit
 def _export_guard():
     try:
+        logging.getLogger("transcriber").info("[atexit] export guard running")
         if Path(TEMP_WAV).exists():
             run_dir = RUN_DIR
             any_final = any(run_dir.glob(f"{STAMP}_video_*.mp4")) or any(run_dir.glob(f"{STAMP}_audio_*.mp3"))
             if not any_final:
                 out_mp3 = run_dir / f"{STAMP}_audio_meeting.mp3"
                 cmd = ["ffmpeg", "-y", "-i", str(TEMP_WAV), "-c:a", "libmp3lame", "-b:a", "192k", str(out_mp3)]
+                logging.getLogger("transcriber").info(f"[atexit] creating fallback MP3: {out_mp3.name}")
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
@@ -2225,6 +2372,14 @@ if __name__ == "__main__":
 
     try:
         log.info("Starting AV + OCR application…"); safe_flush()
+        log.info(f"Python={sys.version.split()[0]} platform={sys.platform} pid={os.getpid()}")
+        try:
+            import pyaudiowpatch as _pa
+            log.info(f"PyAudioWpatch version={getattr(_pa, '__version__', 'unknown')}")
+        except Exception:
+            pass
+        log.info(f"USE_TESS={USE_TESS} APP_CACHE={APP_CACHE}")
+        log.info(f"AVOS_WHISPER_MODEL={os.getenv('AVOS_WHISPER_MODEL', '') or '(default base.en)'} AVOS_COMPUTE={os.getenv('AVOS_COMPUTE', 'int8')}")
 
         if sys.platform.startswith("win"):
             try:
