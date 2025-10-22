@@ -52,11 +52,27 @@ jobs:
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
-          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
+          #git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
 
           # Push all branches, prune deleted ones, and force to keep GitLab in sync
-          git push --force --prune gitlab "refs/heads/*:refs/heads/*"
+          #git push --force --prune gitlab "refs/heads/*:refs/heads/*"
 
           # Push all tags (use explicit refspec so pruning applies to tags too)
-          git push --force --prune gitlab "refs/tags/*:refs/tags/*"
+          #git push --force --prune gitlab "refs/tags/*:refs/tags/*"
 
+          # 1) Add GitLab remote (keep your token)
+          git remote remove gitlab 2>/dev/null || true
+          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
+
+          # 2) Ensure your local 'main' matches the source of truth (GitHub)
+          git fetch origin main
+          git checkout -B main origin/main
+
+          # 3) Push default branch first (no force)
+          git push gitlab main
+
+          # 4) Push your feature branch(es) (no force)
+          git push gitlab feature/dual-audio
+
+          # 5) Push tags (no force)
+          git push gitlab --tags
