@@ -899,7 +899,13 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self._get_ocr_transcript = get_ocr_transcript_fn or (lambda: "")
 
         self.debug = DEBUG_MODE
-        self.force_transcription_interval = 20
+        self.mic_bytes_total = 0
+        self.spk_bytes_total = 0
+        self.last_meter_log = time.time()
+        self.force_transcription_interval = 8  # was 20; faster fallback
+        self.mix_mic_gain = 1.0
+        self.mix_spk_gain = 1.0
+
         self.last_transcription_time = time.time()
 
         self.transcription_lock = Lock()
@@ -1289,420 +1295,427 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
                 # ----------------- Audio loop (dual source) -----------------
                 def audio_loop(self):
-                    self._log_ui("Audio: loop entered (dual-source)"); safe_flush()
-
+                    self._log_ui("Audio: loop entered (dual-source)")
                     VAD_SR = 16000
                     VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
 
-                    consecutive_empty_reads = 0
-                    MAX_EMPTY_READS = 30  # allow sparse input if only one stream present
+                    def to_mono_i16(raw, ch):
+                        if not raw:
+                            return None
+                        try:
+                            x = np.frombuffer(raw, dtype=np.int16)
+                            ch = max(1, int(ch or 1))
+                            if ch > 1:
+                                x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
+                            return x
+                        except Exception:
+                            return None
 
-                    try:
-                        while not self.stop_event.is_set():
-                            with self.stream_lock:
-                                s_m = self.stream_mic
-                                s_s = self.stream_spk
-                                m_state = dict(self.mic_open)
-                                s_state = dict(self.spk_open)
+                    def i16_to_f32(x):
+                        return (x.astype(np.float32) / 32768.0) if x is not None and x.size else None
 
-                            got_any = False
+                    def rms_db(x):
+                        if x is None or not x.size:
+                            return -120.0
+                        r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)) + 1e-12)
+                        return 20.0 * math.log10(r + 1e-20)
 
-                            # read one 30ms-ish chunk per active stream
-                            mic_block = None; spk_block = None
+                    # local snapshots of streams/params
+                    with self.stream_lock:
+                        s_m = getattr(self, "stream_mic", None)
+                        s_s = getattr(self, "stream_spk", None)
+                    m_state = dict(getattr(self, "mic_open", {}) or {})
+                    s_state = dict(getattr(self, "spk_open", {}) or {})
 
-                            if s_m and s_m.is_active() and m_state:
-                                try:
-                                    mic_block = s_m.read(m_state["fpb"], exception_on_overflow=False)
-                                    got_any = got_any or bool(mic_block)
-                                except Exception:
-                                    mic_block = None
+                    # frames-per-buffer per device
+                    m_fpb = int(m_state.get("fpb", 0) or 0)
+                    s_fpb = int(s_state.get("fpb", 0) or 0)
 
-                            if s_s and s_s.is_active() and s_state:
-                                try:
-                                    spk_block = s_s.read(s_state["fpb"], exception_on_overflow=False)
-                                    got_any = got_any or bool(spk_block)
-                                except Exception:
-                                    spk_block = None
+                    while not self.stop_event.is_set():
+                        # Pull a block from each *if available*
+                        mic_block = None
+                        spk_block = None
 
-                            if not got_any:
-                                consecutive_empty_reads += 1
-                                if consecutive_empty_reads >= MAX_EMPTY_READS:
-                                    break
-                                time.sleep(0.01)
-                                continue
-                            else:
-                                consecutive_empty_reads = 0
-                                
-                            with self.stream_lock:
-                                s_m = self.stream_mic
-                                s_s = self.stream_spk
-                                m_state = dict(self.mic_open or {})
-                                s_state = dict(self.spk_open or {})
-                            
-                            # Convert each present block to mono int16 @ its native SR
-                            def to_mono_i16(raw, ch):
-                                if not raw:
-                                    return None
-                                try:
-                                    x = np.frombuffer(raw, dtype=np.int16)
-                                    ch = max(1, int(ch or 1))
-                                    if ch > 1:
-                                        x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
-                                    return x
-                                except Exception:
-                                    return None
+                        with self.stream_lock:
+                            s_m = getattr(self, "stream_mic", None)
+                            s_s = getattr(self, "stream_spk", None)
 
-                            mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
-                            spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
+                        try:
+                            if s_m and s_m.is_active() and m_fpb > 0:
+                                mic_block = s_m.read(m_fpb, exception_on_overflow=False)
+                                self.mic_bytes_total += len(mic_block or b"")
+                        except Exception:
+                            mic_block = None
 
-                            # Keep per-source shadows at native SR (bytes)
-                            if mic_i16 is not None:
-                                self.buffer_mic.append(mic_i16.tobytes())
-                            if spk_i16 is not None:
-                                self.buffer_spk.append(spk_i16.tobytes())
+                        try:
+                            if s_s and s_s.is_active() and s_fpb > 0:
+                                spk_block = s_s.read(s_fpb, exception_on_overflow=False)
+                                self.spk_bytes_total += len(spk_block or b"")
+                        except Exception:
+                            spk_block = None
 
-                            # Mix to 16k mono for the legacy path (and WAV writer)
-                            mic_sr = int(m_state.get("sr", 16000) or 16000)
-                            spk_sr = int(s_state.get("sr", 16000) or 16000)
-                            mic_f32_16k = resample_to_16k(mic_i16.astype(np.float32)/32768.0, mic_sr) if mic_i16 is not None else None
-                            spk_f32_16k = resample_to_16k(spk_i16.astype(np.float32)/32768.0, spk_sr) if spk_i16 is not None else None
-                            
-                            # Align lengths and average
-                            if mic_f32_16k is None and spk_f32_16k is None:
-                                time.sleep(0.005); continue
-                            if mic_f32_16k is None:
-                                mixed_f32 = spk_f32_16k
-                            elif spk_f32_16k is None:
-                                mixed_f32 = mic_f32_16k
-                            else:
-                                n = min(mic_f32_16k.size, spk_f32_16k.size)
-                                if n <= 0:
-                                    mixed_f32 = (mic_f32_16k if mic_f32_16k.size else spk_f32_16k)
-                                else:
-                                    mixed_f32 = 0.5 * (mic_f32_16k[:n] + spk_f32_16k[:n])
+                        # Convert to mono i16
+                        mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
+                        spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
 
-                            # Convert to int16 bytes and store in legacy merged buffer
-                            mixed_i16 = np.clip(np.round(mixed_f32 * 32768.0), -32768, 32767).astype(np.int16)
-                            mixed_bytes = mixed_i16.tobytes()
+                        # Resample to 16k float32 for VAD + mix
+                        m_sr = int(m_state.get("sr", 16000) or 16000)
+                        s_sr = int(s_state.get("sr", 16000) or 16000)
+                        mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
+                        spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
+
+                        # Log meters occasionally so we can see if mic is alive
+                        now = time.time()
+                        if now - self.last_meter_log > 5.0:
+                            db_m = rms_db(mic_f) if mic_f is not None else -120.0
+                            db_s = rms_db(spk_f) if spk_f is not None else -120.0
+                            self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
+                                         f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
+                            self.last_meter_log = now
+
+                        # Per-source VAD (use last 30ms of each if present)
+                        def vad_last30(xf):
+                            if xf is None or xf.size < VAD_SAMPLES_30MS:
+                                return False
+                            # convert float back to int16 for webrtcvad
+                            y16 = np.clip(np.round(xf[-VAD_SAMPLES_30MS:]*32768.0), -32768, 32767).astype(np.int16)
+                            try:
+                                return self.vad.is_speech(y16.tobytes(), VAD_SR)
+                            except Exception:
+                                return False
+
+                        mic_speech = vad_last30(mic_f)
+                        spk_speech = vad_last30(spk_f)
+
+                        # Build the mixed float32 16k chunk (align lengths)
+                        mix = None
+                        if mic_f is not None and spk_f is not None:
+                            n = min(mic_f.size, spk_f.size)
+                            if n > 0:
+                                mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
+                                # prevent clipping
+                                mix = np.clip(mix, -1.0, 1.0)
+                        elif mic_f is not None:
+                            mix = self.mix_mic_gain * mic_f
+                        elif spk_f is not None:
+                            mix = self.mix_spk_gain * spk_f
+
+                        # Append mixed audio to the transcription buffer in raw int16 (16k)
+                        if mix is not None and mix.size:
+                            i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
                             with self.buffer_lock:
-                                self.buffer.append(mixed_bytes)
+                                self.buffer.append(i16)
 
-                            # Write to WAV if recording
-                            if self.recording and self.wav_writer:
-                                try:
-                                    self.wav_writer.writeframes(mixed_bytes)
-                                    self.samples_written += mixed_i16.size
-                                except Exception as e:
-                                    log.exception(f"Recording write error: {e}")
+                        # UI + scheduling
+                        if mic_speech or spk_speech:
+                            QtCore.QMetaObject.invokeMethod(
+                                self.status_label, "setText", Qt.QueuedConnection,
+                                QtCore.Q_ARG(str, "Status: Listening…")
+                            )
+                            self.was_speech = True
+                            # trigger immediately when either talks
+                            self._try_schedule_transcription()
+                            # Hint for tagging (which source spoke last)
+                            if mic_speech:
+                                self.transcription_hints.append("[MIC]")
+                            if spk_speech:
+                                self.transcription_hints.append("[SPK]")
+                        else:
+                            if self.was_speech:
+                                self.was_speech = False
+                                QtCore.QMetaObject.invokeMethod(
+                                    self.status_label, "setText", Qt.QueuedConnection,
+                                    QtCore.Q_ARG(str, "Status: Silent")
+                                )
+                            # time-based fallback: if buffer has data, flush every few seconds
+                            if (now - self.last_transcription_time) > self.force_transcription_interval:
+                                with self.buffer_lock:
+                                    if len(self.buffer) > 0:
+                                        self._try_schedule_transcription()
+
+                        time.sleep(0.002)
+
+                                # ----------------- Transcription -----------------
+                                def _try_schedule_transcription(self):
+                                    if self.suspend_transcription.is_set():
+                                        return
+                                    if self.transcription_in_progress.is_set() or self.transcription_scheduled.is_set():
+                                        return
+                                    self.transcription_scheduled.set()
+                                    def run():
+                                        try:
+                                            self.transcribe_buffer()
+                                        finally:
+                                            self.transcription_scheduled.clear()
+                                    Thread(target=run, name="TranscribeBuffer", daemon=True).start()
+
+                                @contextmanager
+                                def transcription_guard(self):
+                                    self.transcription_in_progress.set()
                                     try:
-                                        if self.wav_writer: self.wav_writer.close()
+                                        yield
+                                    finally:
+                                        self.transcription_in_progress.clear()
+
+                                def check_force_transcription(self):
+                                    if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
+                                        return
+                                    with self.buffer_lock:
+                                        buf_has_data = len(self.buffer) > 0
+                                    if not buf_has_data:
+                                        return
+                                    now = time.time()
+                                    if (now - self.last_transcription_time) > self.force_transcription_interval:
+                                        self._try_schedule_transcription()
+
+                                def transcribe_buffer(self):
+                                    with self.transcription_guard():
+                                        if self.model is None:
+                                            self._log_ui("Model still loading… keeping audio buffered.")
+                                            time.sleep(0.25)
+                                            return
+
+                                        self.last_transcription_time = time.time()
+
+                                        # Pull snapshots
+                                        with self.buffer_lock:
+                                            merged_bytes = b"".join(self.buffer); self.buffer.clear()
+                                            mic_bytes = b"".join(self.buffer_mic); self.buffer_mic.clear()
+                                            spk_bytes = b"".join(self.buffer_spk); self.buffer_spk.clear()
+
+                                        if not (merged_bytes or mic_bytes or spk_bytes):
+                                            self._log_ui("Transcribe skip: buffers empty.")
+                                            return
+
+                                        # Build per-source 16k float arrays
+                                        merged_f32_16k = i16_bytes_to_f32_16k(merged_bytes, 16000) if merged_bytes else np.zeros(0, np.float32)
+                                        mic_f32_16k = i16_bytes_to_f32_16k(mic_bytes, int(self.mic_open.get("sr", 16000))) if mic_bytes else np.zeros(0, np.float32)
+                                        spk_f32_16k = i16_bytes_to_f32_16k(spk_bytes, int(self.spk_open.get("sr", 16000))) if spk_bytes else np.zeros(0, np.float32)
+
+                                        try:
+                                            # Case A: both sources → tag + interleave by timestamps
+                                            if mic_f32_16k.size >= 1600 and spk_f32_16k.size >= 1600:
+                                                mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
+                                                spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
+                                                lines = interleave_tagged_segments(mic_segs, spk_segs)
+                                                if not lines and merged_f32_16k.size >= 1600:
+                                                    # fallback: merged (untagged)
+                                                    m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                                                    lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+                                            else:
+                                                # Case B: only one source available → tag appropriately
+                                                if mic_f32_16k.size >= 1600:
+                                                    mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                                                    lines = [f"[MIC] {seg.text.strip()}" for seg in mic_segs if getattr(seg, "text", "").strip()]
+                                                elif spk_f32_16k.size >= 1600:
+                                                    spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                                                    lines = [f"[SPK] {seg.text.strip()}" for seg in spk_segs if getattr(seg, "text", "").strip()]
+                                                else:
+                                                    # Last resort: merged
+                                                    if merged_f32_16k.size < 1600:
+                                                        self._log_ui("Transcribe skip: insufficient audio.")
+                                                        return
+                                                    m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                                                    lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+
+                                            if lines:
+                                                ts = datetime.now().strftime("%H:%M:%S")
+
+                                                # look back over recent hints to choose a label for untagged lines
+                                                label = ""
+                                                try:
+                                                    for hint in reversed(list(self.transcription_hints)[-5:]):
+                                                        if hint in ("[MIC]", "[SPK]"):
+                                                            label = hint + " "
+                                                            break
+                                                except Exception:
+                                                    pass
+
+                                                for tline in lines:
+                                                    # don't double-tag if the model already produced a [MIC]/[SPK] line
+                                                    if tline.startswith("[MIC]") or tline.startswith("[SPK]"):
+                                                        prefix = ""
+                                                    else:
+                                                        prefix = label
+                                                    self._write_audio_line(f"[{ts}] {prefix}{tline}")
+
+                                        except Exception:
+                                            logging.getLogger("transcriber").exception("Transcription Error")
+                                        finally:
+                                            self.transcription_counter += 1
+
+                                # ----------------- Misc (unchanged-ish) -----------------
+                                def _log_ui(self, msg: str):
+                                    try: self._ui_log(msg)
+                                    except Exception: pass
+
+                                def _write_audio_line(self, line: str):
+                                    self.transcript_lines.append(line)
+                                    QtCore.QMetaObject.invokeMethod(
+                                        self.transcript_box, "appendPlainText",
+                                        Qt.QueuedConnection, QtCore.Q_ARG(str, line)
+                                    )
+
+                                def get_audio_time(self) -> float | None:
+                                    # we write merged @16k mono; compute time from samples_written
+                                    if self.recording:
+                                        t = float(self.samples_written) / 16000.0
+                                        if t < self._audio_time_last:
+                                            t = self._audio_time_last
+                                        self._audio_time_last = t
+                                        return t
+                                    return None
+
+                                def copy_transcript(self):
+                                    audio_text = '\n'.join(self.transcript_lines) if self.transcript_lines else ""
+                                    try:
+                                        ocr_text = self._get_ocr_transcript() or ""
+                                    except Exception:
+                                        ocr_text = ""
+                                    try:
+                                        if self.transcript_lines:
+                                            start_str = self.transcript_lines[0][1:9]
+                                            end_str = self.transcript_lines[-1][1:9]
+                                            today = datetime.today()
+                                            start_dt = datetime.combine(today, datetime.strptime(start_str, "%H:%M:%S").time())
+                                            end_dt = datetime.combine(today, datetime.strptime(end_str, "%H:%M:%S").time())
+                                            if end_dt < start_dt:
+                                                end_dt += timedelta(days=1)
+                                            duration = str(end_dt - start_dt)
+                                        else:
+                                            start_str = datetime.now().strftime("%H:%M:%S")
+                                            duration = "Unknown"
+                                    except Exception:
+                                        start_str = datetime.now().strftime("%H:%M:%S")
+                                        duration = "Unknown"
+                                    header = custom_header.replace("{start}", start_str).replace("{duration}", duration)
+                                    full = "\n".join([header, "", "=== AUDIO TRANSCRIPT ===", audio_text or "(no audio transcript captured)",
+                                                      "", "=== OCR TRANSCRIPT ===", ocr_text or "(no OCR transcript captured)"])
+                                    try:
+                                        pyperclip.copy(full)
+                                        self._log_ui("Combined (audio + OCR) transcripts copied to clipboard.")
+                                    except Exception:
+                                        log.exception("Failed to copy combined transcripts to clipboard.")
+
+                                def _switch_to_file_input(self):
+                                    self.suspend_transcription.set()
+                                    try:
+                                        self.status_label.setText("Status: Loading file...")
+                                        QtCore.QCoreApplication.processEvents()
+                                        options = QtWidgets.QFileDialog.Options()
+                                        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+                                        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                                            self, "Select Audio/Video File", "",
+                                            "Media Files (*.mp3 *.wav *.mp4 *.m4a *.flac *.aac *.ogg *.webm *.mkv);;All Files (*)",
+                                            options=options
+                                        )
+                                        if file_path:
+                                            self._log_ui(f"Audio: transcribing file '{os.path.basename(file_path)}'.")
+                                            self.transcribe_file(file_path)
+                                        else:
+                                            self.status_label.setText("Status: File load canceled.")
+                                            self._log_ui("Audio: file selection canceled.")
+                                    except Exception:
+                                        log.exception("Switch to file input failed.")
+                                        self.status_label.setText("Status: Error switching to file.")
+                                    finally:
+                                        self.suspend_transcription.clear()
+
+                                def transcribe_file(self, file_path):
+                                    """Use faster-whisper on whole files (audio or video)."""
+                                    try:
+                                        if self.model is None:
+                                            self._log_ui("Model not ready yet; cannot transcribe file.")
+                                            return
+                                        segments, info = self.model.transcribe(
+                                            file_path, language="en", beam_size=1, vad_filter=True, without_timestamps=False
+                                        )
+                                        for seg in segments:
+                                            if getattr(seg, "text", ""):
+                                                ts = datetime.now().strftime("%H:%M:%S")
+                                                self._write_audio_line(f"[{ts}] {seg.text.strip()}")
+                                        self.copy_button.setEnabled(bool(self.transcript_lines))
+                                    except Exception:
+                                        logging.getLogger("transcriber").exception("File Transcription Error")
+
+                                def stop_recording_if_active(self):
+                                    if not self.recording:
+                                        return
+                                    try:
+                                        if self.wav_writer:
+                                            self.wav_writer.close()
                                     except Exception:
                                         pass
                                     self.wav_writer = None
                                     self.recording = False
+                                    self.ui_log.emit(f"Audio: recording stopped ({self.recording_path})")
+                                    if self.recording_path and self.audio_start_epoch is not None:
+                                        self.recording_stopped.emit(self.recording_path, self.audio_start_epoch)
 
-                            # VAD on the merged 16k (last 30 ms)
-                            try:
-                                vad_i16 = mixed_i16
-                                if vad_i16.size < VAD_SAMPLES_30MS:
-                                    is_speech = False
-                                else:
-                                    is_speech = self.vad.is_speech(vad_i16[-VAD_SAMPLES_30MS:].tobytes(), VAD_SR)
-                            except Exception:
-                                is_speech = False
+                                def shutdown(self):
+                                    try:
+                                        self.suspend_transcription.set()
+                                        self.stop_event.set()
+                                        try:
+                                            if hasattr(self, "force_timer") and self.force_timer:
+                                                self.force_timer.stop()
+                                        except Exception:
+                                            logging.getLogger("transcriber").exception("Audio force_timer stop failed")
 
-                            if is_speech:
-                                QtCore.QMetaObject.invokeMethod(self.status_label, "setText",
-                                    Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Listening…"))
-                                self.was_speech = True
-                                now = time.time()
-                                if len(self.buffer) >= self.buffer.maxlen - 1 or (now - self.last_transcription_time) > self.force_transcription_interval:
-                                    self._try_schedule_transcription()
-                            else:
-                                if self.was_speech:
-                                    self.was_speech = False
-                                    QtCore.QMetaObject.invokeMethod(self.status_label, "setText",
-                                        Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Silent"))
-                                    with self.buffer_lock:
-                                        enough = len(self.buffer) >= POOL_CHUNKS
-                                    if enough:
-                                        self._try_schedule_transcription()
+                                        # Close streams
+                                        try:
+                                            with self.opening_lock:
+                                                with self.stream_lock:
+                                                    for s in (self.stream_mic, self.stream_spk):
+                                                        if s:
+                                                            try: s.stop_stream()
+                                                            except Exception: pass
+                                                            try: s.close()
+                                                            except Exception: pass
+                                                    self.stream_mic = None
+                                                    self.stream_spk = None
+                                        except Exception:
+                                            logging.getLogger("transcriber").exception("Audio stream close failed")
 
-                            time.sleep(0.002)
-                    finally:
-                        self._log_ui("Audio: loop exiting (dual-source)"); safe_flush()
+                                        # Briefly wait transcription
+                                        try:
+                                            if self.transcription_in_progress.is_set():
+                                                waited = 0.0
+                                                while self.transcription_in_progress.is_set() and waited < 1.0:
+                                                    time.sleep(0.1); waited += 0.1
+                                        except Exception:
+                                            pass
 
-                # ----------------- Transcription -----------------
-                def _try_schedule_transcription(self):
-                    if self.suspend_transcription.is_set():
-                        return
-                    if self.transcription_in_progress.is_set() or self.transcription_scheduled.is_set():
-                        return
-                    self.transcription_scheduled.set()
-                    def run():
-                        try:
-                            self.transcribe_buffer()
-                        finally:
-                            self.transcription_scheduled.clear()
-                    Thread(target=run, name="TranscribeBuffer", daemon=True).start()
+                                        # Join audio thread
+                                        try:
+                                            t = self.audio_thread
+                                            if t and t.is_alive():
+                                                t.join(timeout=0.5)
+                                                if t.is_alive():
+                                                    logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
+                                        except Exception:
+                                            logging.getLogger("transcriber").exception("Audio thread join failed")
 
-                @contextmanager
-                def transcription_guard(self):
-                    self.transcription_in_progress.set()
-                    try:
-                        yield
-                    finally:
-                        self.transcription_in_progress.clear()
+                                        # Terminate PyAudio
+                                        try:
+                                            if hasattr(self, "pa") and self.pa:
+                                                self.pa.terminate()
+                                        except Exception:
+                                            logging.getLogger("transcriber").exception("PyAudio terminate failed")
 
-                def check_force_transcription(self):
-                    if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
-                        return
-                    with self.buffer_lock:
-                        buf_has_data = len(self.buffer) > 0
-                    if not buf_has_data:
-                        return
-                    now = time.time()
-                    if (now - self.last_transcription_time) > self.force_transcription_interval:
-                        self._try_schedule_transcription()
+                                        # Ensure WAV closed
+                                        try:
+                                            if self.wav_writer:
+                                                self.wav_writer.close()
+                                        except Exception:
+                                            pass
+                                        finally:
+                                            self.wav_writer = None
+                                            self.recording = False
+                                    except Exception:
+                                        logging.getLogger("transcriber").exception("Audio widget shutdown error (hardened).")
 
-                def transcribe_buffer(self):
-                    with self.transcription_guard():
-                        if self.model is None:
-                            self._log_ui("Model still loading… keeping audio buffered.")
-                            time.sleep(0.25)
-                            return
-
-                        self.last_transcription_time = time.time()
-
-                        # Pull snapshots
-                        with self.buffer_lock:
-                            merged_bytes = b"".join(self.buffer); self.buffer.clear()
-                            mic_bytes = b"".join(self.buffer_mic); self.buffer_mic.clear()
-                            spk_bytes = b"".join(self.buffer_spk); self.buffer_spk.clear()
-
-                        if not (merged_bytes or mic_bytes or spk_bytes):
-                            self._log_ui("Transcribe skip: buffers empty.")
-                            return
-
-                        # Build per-source 16k float arrays
-                        merged_f32_16k = i16_bytes_to_f32_16k(merged_bytes, 16000) if merged_bytes else np.zeros(0, np.float32)
-                        mic_f32_16k = i16_bytes_to_f32_16k(mic_bytes, int(self.mic_open.get("sr", 16000))) if mic_bytes else np.zeros(0, np.float32)
-                        spk_f32_16k = i16_bytes_to_f32_16k(spk_bytes, int(self.spk_open.get("sr", 16000))) if spk_bytes else np.zeros(0, np.float32)
-
-                        try:
-                            # Case A: both sources → tag + interleave by timestamps
-                            if mic_f32_16k.size >= 1600 and spk_f32_16k.size >= 1600:
-                                mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
-                                spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
-                                lines = interleave_tagged_segments(mic_segs, spk_segs)
-                                if not lines and merged_f32_16k.size >= 1600:
-                                    # fallback: merged (untagged)
-                                    m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
-                                    lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
-                            else:
-                                # Case B: only one source available → tag appropriately
-                                if mic_f32_16k.size >= 1600:
-                                    mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
-                                    lines = [f"[MIC] {seg.text.strip()}" for seg in mic_segs if getattr(seg, "text", "").strip()]
-                                elif spk_f32_16k.size >= 1600:
-                                    spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
-                                    lines = [f"[SPK] {seg.text.strip()}" for seg in spk_segs if getattr(seg, "text", "").strip()]
-                                else:
-                                    # Last resort: merged
-                                    if merged_f32_16k.size < 1600:
-                                        self._log_ui("Transcribe skip: insufficient audio.")
-                                        return
-                                    m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
-                                    lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
-
-                            if lines:
-                                timestamp = datetime.now().strftime("%H:%M:%S")
-                                for tline in lines:
-                                    self._write_audio_line(f"[{timestamp}] {tline}")
-                                QtCore.QMetaObject.invokeMethod(self.copy_button, "setEnabled", Qt.QueuedConnection, QtCore.Q_ARG(bool, True))
-                                # hint store (merged)
-                                try:
-                                    txt = " ".join(lines)
-                                    if txt: self.transcription_hints.append(txt)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            logging.getLogger("transcriber").exception("Transcription Error")
-                        finally:
-                            self.transcription_counter += 1
-
-                # ----------------- Misc (unchanged-ish) -----------------
-                def _log_ui(self, msg: str):
-                    try: self._ui_log(msg)
-                    except Exception: pass
-
-                def _write_audio_line(self, line: str):
-                    self.transcript_lines.append(line)
-                    QtCore.QMetaObject.invokeMethod(
-                        self.transcript_box, "appendPlainText",
-                        Qt.QueuedConnection, QtCore.Q_ARG(str, line)
-                    )
-
-                def get_audio_time(self) -> float | None:
-                    # we write merged @16k mono; compute time from samples_written
-                    if self.recording:
-                        t = float(self.samples_written) / 16000.0
-                        if t < self._audio_time_last:
-                            t = self._audio_time_last
-                        self._audio_time_last = t
-                        return t
-                    return None
-
-                def copy_transcript(self):
-                    audio_text = '\n'.join(self.transcript_lines) if self.transcript_lines else ""
-                    try:
-                        ocr_text = self._get_ocr_transcript() or ""
-                    except Exception:
-                        ocr_text = ""
-                    try:
-                        if self.transcript_lines:
-                            start_str = self.transcript_lines[0][1:9]
-                            end_str = self.transcript_lines[-1][1:9]
-                            today = datetime.today()
-                            start_dt = datetime.combine(today, datetime.strptime(start_str, "%H:%M:%S").time())
-                            end_dt = datetime.combine(today, datetime.strptime(end_str, "%H:%M:%S").time())
-                            if end_dt < start_dt:
-                                end_dt += timedelta(days=1)
-                            duration = str(end_dt - start_dt)
-                        else:
-                            start_str = datetime.now().strftime("%H:%M:%S")
-                            duration = "Unknown"
-                    except Exception:
-                        start_str = datetime.now().strftime("%H:%M:%S")
-                        duration = "Unknown"
-                    header = custom_header.replace("{start}", start_str).replace("{duration}", duration)
-                    full = "\n".join([header, "", "=== AUDIO TRANSCRIPT ===", audio_text or "(no audio transcript captured)",
-                                      "", "=== OCR TRANSCRIPT ===", ocr_text or "(no OCR transcript captured)"])
-                    try:
-                        pyperclip.copy(full)
-                        self._log_ui("Combined (audio + OCR) transcripts copied to clipboard.")
-                    except Exception:
-                        log.exception("Failed to copy combined transcripts to clipboard.")
-
-                def _switch_to_file_input(self):
-                    self.suspend_transcription.set()
-                    try:
-                        self.status_label.setText("Status: Loading file...")
-                        QtCore.QCoreApplication.processEvents()
-                        options = QtWidgets.QFileDialog.Options()
-                        options |= QtWidgets.QFileDialog.DontUseNativeDialog
-                        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                            self, "Select Audio/Video File", "",
-                            "Media Files (*.mp3 *.wav *.mp4 *.m4a *.flac *.aac *.ogg *.webm *.mkv);;All Files (*)",
-                            options=options
-                        )
-                        if file_path:
-                            self._log_ui(f"Audio: transcribing file '{os.path.basename(file_path)}'.")
-                            self.transcribe_file(file_path)
-                        else:
-                            self.status_label.setText("Status: File load canceled.")
-                            self._log_ui("Audio: file selection canceled.")
-                    except Exception:
-                        log.exception("Switch to file input failed.")
-                        self.status_label.setText("Status: Error switching to file.")
-                    finally:
-                        self.suspend_transcription.clear()
-
-                def transcribe_file(self, file_path):
-                    """Use faster-whisper on whole files (audio or video)."""
-                    try:
-                        if self.model is None:
-                            self._log_ui("Model not ready yet; cannot transcribe file.")
-                            return
-                        segments, info = self.model.transcribe(
-                            file_path, language="en", beam_size=1, vad_filter=True, without_timestamps=False
-                        )
-                        for seg in segments:
-                            if getattr(seg, "text", ""):
-                                ts = datetime.now().strftime("%H:%M:%S")
-                                self._write_audio_line(f"[{ts}] {seg.text.strip()}")
-                        self.copy_button.setEnabled(bool(self.transcript_lines))
-                    except Exception:
-                        logging.getLogger("transcriber").exception("File Transcription Error")
-
-                def stop_recording_if_active(self):
-                    if not self.recording:
-                        return
-                    try:
-                        if self.wav_writer:
-                            self.wav_writer.close()
-                    except Exception:
-                        pass
-                    self.wav_writer = None
-                    self.recording = False
-                    self.ui_log.emit(f"Audio: recording stopped ({self.recording_path})")
-                    if self.recording_path and self.audio_start_epoch is not None:
-                        self.recording_stopped.emit(self.recording_path, self.audio_start_epoch)
-
-                def shutdown(self):
-                    try:
-                        self.suspend_transcription.set()
-                        self.stop_event.set()
-                        try:
-                            if hasattr(self, "force_timer") and self.force_timer:
-                                self.force_timer.stop()
-                        except Exception:
-                            logging.getLogger("transcriber").exception("Audio force_timer stop failed")
-
-                        # Close streams
-                        try:
-                            with self.opening_lock:
-                                with self.stream_lock:
-                                    for s in (self.stream_mic, self.stream_spk):
-                                        if s:
-                                            try: s.stop_stream()
-                                            except Exception: pass
-                                            try: s.close()
-                                            except Exception: pass
-                                    self.stream_mic = None
-                                    self.stream_spk = None
-                        except Exception:
-                            logging.getLogger("transcriber").exception("Audio stream close failed")
-
-                        # Briefly wait transcription
-                        try:
-                            if self.transcription_in_progress.is_set():
-                                waited = 0.0
-                                while self.transcription_in_progress.is_set() and waited < 1.0:
-                                    time.sleep(0.1); waited += 0.1
-                        except Exception:
-                            pass
-
-                        # Join audio thread
-                        try:
-                            t = self.audio_thread
-                            if t and t.is_alive():
-                                t.join(timeout=0.5)
-                                if t.is_alive():
-                                    logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
-                        except Exception:
-                            logging.getLogger("transcriber").exception("Audio thread join failed")
-
-                        # Terminate PyAudio
-                        try:
-                            if hasattr(self, "pa") and self.pa:
-                                self.pa.terminate()
-                        except Exception:
-                            logging.getLogger("transcriber").exception("PyAudio terminate failed")
-
-                        # Ensure WAV closed
-                        try:
-                            if self.wav_writer:
-                                self.wav_writer.close()
-                        except Exception:
-                            pass
-                        finally:
-                            self.wav_writer = None
-                            self.recording = False
-                    except Exception:
-                        logging.getLogger("transcriber").exception("Audio widget shutdown error (hardened).")
-
-    # ======================
+# ======================
 #   Main Window + Export & Cleanup
 # ======================
 class MainWindow(QtWidgets.QMainWindow):
