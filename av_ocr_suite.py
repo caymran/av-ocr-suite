@@ -1399,7 +1399,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             try:
                 if s_m and s_m.is_active() and m_fpb > 0:
-                    mic_block = s_m.read(m_fpb, exception_on_overflow=False)
+                    mic_block = safe_read(s_m, m_fpb)
                     self.mic_bytes_total += len(mic_block or b"")
             except Exception as e:
                 self._log_ui(f"Audio[MIC]: read error → {type(e).__name__}: {e}")
@@ -1408,7 +1408,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             try:
                 if s_s and s_s.is_active() and s_fpb > 0:
-                    spk_block = s_s.read(s_fpb, exception_on_overflow=False)
+                    spk_block = safe_read(s_s, s_fpb)
                     self.spk_bytes_total += len(spk_block or b"")
             except Exception as e:
                 self._log_ui(f"Audio[SPK]: read error → {type(e).__name__}: {e}")
@@ -1562,9 +1562,9 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             self._log_ui("Transcribe not scheduled: already scheduled")
             return
         with self.buffer_lock:
-            total_now = (len(b"".join(self.buffer)) +
-                         len(b"".join(self.buffer_mic)) +
-                         len(b"".join(self.buffer_spk)))
+            total_now = sum(len(b) for b in self.buffer) \
+                      + sum(len(b) for b in self.buffer_mic) \
+                      + sum(len(b) for b in self.buffer_spk)
         if total_now < 9600:
             self._log_ui(f"Transcribe not scheduled: total_buf={total_now}B (<9600B)")
             return
@@ -1601,21 +1601,23 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             self.last_transcription_time = time.time()
 
-            # Snapshot – DO NOT CLEAR YET
-            with self.buffer_lock:
-                merged_bytes = b"".join(self.buffer)
-                mic_bytes    = b"".join(self.buffer_mic)
-                spk_bytes    = b"".join(self.buffer_spk)
-                self._log_ui(f"Tbuf: merged={len(merged_bytes)}B mic={len(mic_bytes)}B spk={len(spk_bytes)}B")
-
             # Require at least ~0.3s of audio in any stream before processing
             # 16 kHz * 0.3 s * 2 bytes ≈ 9600 bytes
             MIN_BYTES = 9600
-            if not (len(merged_bytes) >= MIN_BYTES or
-                    len(mic_bytes)    >= MIN_BYTES or
-                    len(spk_bytes)    >= MIN_BYTES):
-                # Not enough yet; keep accumulating
+
+            with self.buffer_lock:
+                merged_len = sum(len(b) for b in self.buffer)
+                mic_len    = sum(len(b) for b in self.buffer_mic)
+                spk_len    = sum(len(b) for b in self.buffer_spk)
+
+            if not (merged_len >= MIN_BYTES or mic_len >= MIN_BYTES or spk_len >= MIN_BYTES):
                 return
+
+            # then snapshot actual bytes once you’ve decided to proceed
+            with self.buffer_lock:
+                merged_bytes = b"".join(self.buffer); self.buffer.clear()
+                mic_bytes    = b"".join(self.buffer_mic); self.buffer_mic.clear()
+                spk_bytes    = b"".join(self.buffer_spk); self.buffer_spk.clear()
 
             # We’re going to process; NOW clear the buffers
             with self.buffer_lock:
