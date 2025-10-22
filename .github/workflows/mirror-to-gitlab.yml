@@ -52,27 +52,29 @@ jobs:
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
-          #git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
+          set -euo pipefail
 
-          # Push all branches, prune deleted ones, and force to keep GitLab in sync
-          #git push --force --prune gitlab "refs/heads/*:refs/heads/*"
-
-          # Push all tags (use explicit refspec so pruning applies to tags too)
-          #git push --force --prune gitlab "refs/tags/*:refs/tags/*"
-
-          # 1) Add GitLab remote (keep your token)
+          # 0) Remotes
           git remote remove gitlab 2>/dev/null || true
           git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.csde.nswc.navy.mil/caymran.c.cummings.civ/av_ocr_suite.git"
 
-          # 2) Ensure your local 'main' matches the source of truth (GitHub)
-          git fetch origin main
-          git checkout -B main origin/main
+          # 1) Make sure we have full refs from GitHub (origin)
+          #    - all branches into refs/remotes/origin/*
+          #    - all tags
+          git fetch --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            '+refs/tags/*:refs/tags/*'
 
-          # 3) Push default branch first (no force)
+          # 2) Ensure 'main' local branch tracks origin/main and push it first (non-destructive)
+          git checkout -B main origin/main
           git push gitlab main
 
-          # 4) Push your feature branch(es) (no force)
-          git push gitlab feature/dual-audio
+          # 3) Push feature branches: iterate over origin’s remote-tracking branches (excluding main)
+          for rbr in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/ | grep -v '^main$'); do
+            # Create/update a matching local branch to push, or push directly from the remote-tracking ref
+            git push gitlab "refs/remotes/origin/${rbr}:refs/heads/${rbr}"
+          done
 
-          # 5) Push tags (no force)
+          # 4) Push all tags
           git push gitlab --tags
+
