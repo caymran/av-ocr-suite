@@ -126,9 +126,12 @@ try:
     import pytesseract  # noqa: F401
     from PIL import Image  # noqa: F401
 except Exception:
-    pass
+    Image = None
 
-
+if Image is None:
+    self._log("[warn] OCR skipped: Pillow not available")
+    return
+    
 # Qt
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QTabWidget, QMessageBox
@@ -704,7 +707,6 @@ class WindowPickerOverlay(QtWidgets.QWidget):
 class ScreenOCRWidget(QtWidgets.QWidget):
     frame_captured = QtCore.pyqtSignal(QtGui.QImage)
     meeting_name_updated = QtCore.pyqtSignal(str)
-
     def __init__(self, log_fn=None):
         super().__init__()
         self._ui_log = log_fn or (lambda s: None)
@@ -720,6 +722,8 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         self.threshold_spin = QtWidgets.QDoubleSpinBox(); self.threshold_spin.setRange(0.0, 1.0); self.threshold_spin.setSingleStep(0.01); self.threshold_spin.setValue(0.01); self.threshold_spin.setDecimals(2)
         self.delta_spin = QtWidgets.QSpinBox(); self.delta_spin.setRange(1, 255); self.delta_spin.setValue(15); self.delta_spin.setSuffix(" Δ")
         self.debug_chk = QtWidgets.QCheckBox("Debug to panel")
+
+        self.pool = QtCore.QThreadPool.globalInstance()
 
         opt_layout = QtWidgets.QHBoxLayout()
         for w in [QtWidgets.QLabel("Interval:"), self.interval_spin, QtWidgets.QLabel("Change ≥"), self.threshold_spin,
@@ -836,9 +840,6 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         self._do_ocr_and_emit(img, reason=f"change {change_ratio:.2%}")
         self.prev_gray = curr_gray; self.prev_size = sz
 
-    # at __init__ of ScreenOCRWidget
-    self.pool = QtCore.QThreadPool.globalInstance()
-
     def _do_ocr_and_emit(self, img: QtGui.QImage, reason: str):
         if self.hwnd is None:
             self.status.setText("Default black preview (no window selected).")
@@ -860,7 +861,7 @@ class ScreenOCRWidget(QtWidgets.QWidget):
                     text = ""
                     self._log(f"[error] OCR: {e}")
                 QtCore.QMetaObject.invokeMethod(self, "_apply_ocr_text", Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, text), Qt.Q_ARG(str, reason))
+                    QtCore.Q_ARG(str, text), QtCore.Q_ARG(str, reason))
 
         self.pool.start(OCRTask())
 
@@ -1989,7 +1990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         layout = QtWidgets.QHBoxLayout(bar); layout.setContentsMargins(12, 6, 12, 6)
         icon = QtWidgets.QLabel("⏳")
-        lbl  = QtWidgets.QLabel("Loading speech model in the background… Transcription will start once ready.")
+        lbl  = QtWidgets.QLabel("Speech model is initializing…")
         pbar = QtWidgets.QProgressBar(); pbar.setRange(0, 0)
         pbar.setFixedHeight(10)
         layout.addWidget(icon); layout.addWidget(lbl, 1); layout.addWidget(pbar, 0)
