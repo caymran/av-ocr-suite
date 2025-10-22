@@ -1349,6 +1349,23 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
             spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
 
+            # Feed per-source 16k i16 bytes into dedicated buffers (for proper tagging)
+            if mic_i16 is not None and mic_i16.size:
+                try:
+                    mic_bytes_16k = _resample_i16_for_vad(mic_i16, m_sr, 16000)
+                    with self.buffer_lock:
+                        self.buffer_mic.append(mic_bytes_16k)
+                except Exception:
+                    pass
+
+            if spk_i16 is not None and spk_i16.size:
+                try:
+                    spk_bytes_16k = _resample_i16_for_vad(spk_i16, s_sr, 16000)
+                    with self.buffer_lock:
+                        self.buffer_spk.append(spk_bytes_16k)
+                except Exception:
+                    pass
+
             # Log meters occasionally so we can see if mic is alive
             now = time.time()
             if now - self.last_meter_log > 5.0:
@@ -1426,6 +1443,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             return
         if self.transcription_in_progress.is_set() or self.transcription_scheduled.is_set():
             return
+        # quick size gate
+        with self.buffer_lock:
+            size_now = len(b"".join(self.buffer)) + len(b"".join(self.buffer_mic)) + len(b"".join(self.buffer_spk))
+        if size_now < 9600:  # ~0.3s @ 16k mono
+            return
         self.transcription_scheduled.set()
         def run():
             try:
@@ -1462,33 +1484,43 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             self.last_transcription_time = time.time()
 
-            # Pull snapshots
+            # Snapshot – DO NOT CLEAR YET
             with self.buffer_lock:
-                merged_bytes = b"".join(self.buffer); self.buffer.clear()
-                mic_bytes = b"".join(self.buffer_mic); self.buffer_mic.clear()
-                spk_bytes = b"".join(self.buffer_spk); self.buffer_spk.clear()
+                merged_bytes = b"".join(self.buffer)
+                mic_bytes    = b"".join(self.buffer_mic)
+                spk_bytes    = b"".join(self.buffer_spk)
 
-            if not (merged_bytes or mic_bytes or spk_bytes):
-                self._log_ui("Transcribe skip: buffers empty.")
+            # Require at least ~0.3s of audio in any stream before processing
+            # 16 kHz * 0.3 s * 2 bytes ≈ 9600 bytes
+            MIN_BYTES = 9600
+            if not (len(merged_bytes) >= MIN_BYTES or
+                    len(mic_bytes)    >= MIN_BYTES or
+                    len(spk_bytes)    >= MIN_BYTES):
+                # Not enough yet; keep accumulating
                 return
 
-            # Build per-source 16k float arrays
+            # We’re going to process; NOW clear the buffers
+            with self.buffer_lock:
+                self.buffer.clear()
+                self.buffer_mic.clear()
+                self.buffer_spk.clear()
+
+            # --- convert to float32 16k for the model as you already do ---
             merged_f32_16k = i16_bytes_to_f32_16k(merged_bytes, 16000) if merged_bytes else np.zeros(0, np.float32)
-            mic_f32_16k = i16_bytes_to_f32_16k(mic_bytes, int(self.mic_open.get("sr", 16000))) if mic_bytes else np.zeros(0, np.float32)
-            spk_f32_16k = i16_bytes_to_f32_16k(spk_bytes, int(self.spk_open.get("sr", 16000))) if spk_bytes else np.zeros(0, np.float32)
+            mic_f32_16k    = i16_bytes_to_f32_16k(mic_bytes,    16000) if mic_bytes    else np.zeros(0, np.float32)
+            spk_f32_16k    = i16_bytes_to_f32_16k(spk_bytes,    16000) if spk_bytes    else np.zeros(0, np.float32)
 
             try:
-                # Case A: both sources → tag + interleave by timestamps
+                # Prefer true per-source transcription when available
                 if mic_f32_16k.size >= 1600 and spk_f32_16k.size >= 1600:
                     mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
                     spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
                     lines = interleave_tagged_segments(mic_segs, spk_segs)
                     if not lines and merged_f32_16k.size >= 1600:
-                        # fallback: merged (untagged)
                         m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
                         lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
                 else:
-                    # Case B: only one source available → tag appropriately
+                    # Single-source fallbacks with explicit tags
                     if mic_f32_16k.size >= 1600:
                         mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
                         lines = [f"[MIC] {seg.text.strip()}" for seg in mic_segs if getattr(seg, "text", "").strip()]
@@ -1496,7 +1528,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
                         lines = [f"[SPK] {seg.text.strip()}" for seg in spk_segs if getattr(seg, "text", "").strip()]
                     else:
-                        # Last resort: merged
                         if merged_f32_16k.size < 1600:
                             self._log_ui("Transcribe skip: insufficient audio.")
                             return
@@ -1505,8 +1536,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
                 if lines:
                     ts = datetime.now().strftime("%H:%M:%S")
-
-                    # look back over recent hints to choose a label for untagged lines
+                    # Keep your hint-based prefix for untagged merged lines
                     label = ""
                     try:
                         for hint in reversed(list(self.transcription_hints)[-5:]):
@@ -1517,17 +1547,14 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         pass
 
                     for tline in lines:
-                        # don't double-tag if the model already produced a [MIC]/[SPK] line
-                        if tline.startswith("[MIC]") or tline.startswith("[SPK]"):
-                            prefix = ""
-                        else:
-                            prefix = label
+                        prefix = "" if tline.startswith("[MIC]") or tline.startswith("[SPK]") else label
                         self._write_audio_line(f"[{ts}] {prefix}{tline}")
 
             except Exception:
                 logging.getLogger("transcriber").exception("Transcription Error")
             finally:
                 self.transcription_counter += 1
+
 
     # ----------------- Misc (unchanged-ish) -----------------
     def _log_ui(self, msg: str):
