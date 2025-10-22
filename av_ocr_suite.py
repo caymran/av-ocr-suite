@@ -304,22 +304,6 @@ def _ffmpeg_exists() -> bool:
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def _resample_i16_for_vad(mono_i16: np.ndarray, src_sr: int, dst_sr: int) -> bytes:
-    """Quick/cheap linear resample int16 -> int16 for short VAD frames."""
-    if src_sr == dst_sr:
-        return mono_i16.tobytes()
-    x = mono_i16.astype(np.float32) / 32768.0
-    dur = x.size / float(src_sr)
-    if dur <= 0.0:
-        return b""
-    n_new = max(1, int(round(dur * dst_sr)))
-    t_old = np.linspace(0.0, dur, num=x.size, endpoint=False, dtype=np.float32)
-    t_new = np.linspace(0.0, dur, num=n_new,   endpoint=False, dtype=np.float32)
-    y = np.interp(t_new, t_old, x)
-    y16 = np.clip(np.round(y * 32768.0), -32768, 32767).astype(np.int16)
-    return y16.tobytes()
-
-
 def export_archive_build_video(frames_with_ts, wav_path=None, crf=28, output_path=None):
     """
     frames_with_ts: list of tuples (path, t_seconds) sorted by t_seconds (already on audio clock)
@@ -1105,6 +1089,19 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         except Exception:
             log.exception("Device refresh failed.")
 
+    # ----------------- Device change handlers -----------------
+    def on_mic_changed(self, _i):
+        # Debounce rapid changes
+        if not self.device_switch_lock.acquire(blocking=False):
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=True, reopen_spk=False))
+
+    def on_spk_changed(self, _i):
+        if not self.device_switch_lock.acquire(blocking=False):
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=False, reopen_spk=True))
+
+
     def init_audio_defaults(self):
         """
         Restore old behavior:
@@ -1129,311 +1126,299 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self.mic_index = mic.get("index") if mic else None
         self.spk_index = spk.get("index") if spk else None
 
-        def set_model(self, model):
-            self.model = model
-            self._log_ui("Speech model ready. Transcription will begin shortly.")
-            self._try_schedule_transcription()
+    def set_model(self, model):
+        self.model = model
+        self._log_ui("Speech model ready. Transcription will begin shortly.")
+        self._try_schedule_transcription()
 
-        # ----------------- Stream open/close -----------------
-        def _try_open_single(self, dev, label):
-            """Return dict {stream, sr, ch, fpb} or None if no device."""
-            if not dev:
-                return None
-            info = self.pa.get_device_info_by_index(dev["index"])
-            max_in = int(info.get('maxInputChannels', 0))
-            if max_in <= 0:
-                return None
-            default_sr = int(info.get('defaultSampleRate', 44100))
-            sr_candidates = []
-            for sr in (default_sr, 48000, 44100, 32000, 16000, 8000):
-                if sr and sr not in sr_candidates:
-                    sr_candidates.append(sr)
-            ch_candidates = [min(max_in, 2), 1] if max_in >= 2 else [1]
-            last_err = None
-            for sr in sr_candidates:
-                for ch in ch_candidates:
-                    try:
-                        fpb = int(sr * self.chunk_ms / 1000.0)
-                        s = self.pa.open(
-                            format=FORMAT, channels=ch, rate=sr,
-                            input=True, frames_per_buffer=fpb,
-                            input_device_index=dev["index"]
-                        )
-                        self._log_ui(f"Audio[{label}]: opened @ {sr} Hz, ch={ch}, fpb={fpb}")
-                        return {"stream": s, "sr": sr, "ch": ch, "fpb": fpb}
-                    except Exception as e:
-                        last_err = e
-            self._log_ui(f"Audio[{label}]: failed to open (last error: {last_err})")
+    # ----------------- Stream open/close -----------------
+    def _try_open_single(self, dev, label):
+        """Return dict {stream, sr, ch, fpb} or None if no device."""
+        if not dev:
             return None
-
-        def start_audio_thread(self):
-            if getattr(self, "transcribing_file", False):
-                return
-            if self.audio_thread is not None and self.audio_thread.is_alive():
-                return
-
-            def open_and_run():
+        info = self.pa.get_device_info_by_index(dev["index"])
+        max_in = int(info.get('maxInputChannels', 0))
+        if max_in <= 0:
+            return None
+        default_sr = int(info.get('defaultSampleRate', 44100))
+        sr_candidates = []
+        for sr in (default_sr, 48000, 44100, 32000, 16000, 8000):
+            if sr and sr not in sr_candidates:
+                sr_candidates.append(sr)
+        ch_candidates = [min(max_in, 2), 1] if max_in >= 2 else [1]
+        last_err = None
+        for sr in sr_candidates:
+            for ch in ch_candidates:
                 try:
-                    with self.opening_lock:
-                        mic_dev = self.mic_combo.currentData()
-                        spk_dev = self.spk_combo.currentData()
-                        mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
-                        spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
-                        with self.stream_lock:
-                            self.stream_mic = mic_state["stream"] if mic_state else None
-                            self.stream_spk = spk_state["stream"] if spk_state else None
-                            self.mic_open = mic_state or {}
-                            self.spk_open = spk_state or {}
+                    fpb = int(sr * self.chunk_ms / 1000.0)
+                    s = self.pa.open(
+                        format=FORMAT, channels=ch, rate=sr,
+                        input=True, frames_per_buffer=fpb,
+                        input_device_index=dev["index"]
+                    )
+                    self._log_ui(f"Audio[{label}]: opened @ {sr} Hz, ch={ch}, fpb={fpb}")
+                    return {"stream": s, "sr": sr, "ch": ch, "fpb": fpb}
+                except Exception as e:
+                    last_err = e
+        self._log_ui(f"Audio[{label}]: failed to open (last error: {last_err})")
+        return None
 
-                    if not self.stream_mic and not self.stream_spk:
-                        self.status_label.setText("Status: No input streams. Pick Mic and/or Speaker.")
-                        self.copy_button.setEnabled(bool(self.transcript_lines))
-                        return
+    def start_audio_thread(self):
+        if getattr(self, "transcribing_file", False):
+            return
+        if self.audio_thread is not None and self.audio_thread.is_alive():
+            return
 
-                    # Begin recording to a 16 kHz mono WAV (merged)
-                    self.begin_recording_if_ready()
-
-                    self.stop_event.clear()
-                    self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
-                    self.audio_thread.start()
-                    self._log_ui("Audio: streams opened and audio thread started (dual-capable).")
-                    self.copy_button.setEnabled(True)
-                except Exception:
-                    log.exception("start_audio_thread: error")
-
-            QtCore.QTimer.singleShot(0, open_and_run)
-
-        def begin_recording_if_ready(self):
-            if self.recording:
-                return
-            _ensure_dir(TEMP_DIR); _ensure_dir(TEMP_FRAMES)
+        def open_and_run():
             try:
-                ww = wave.open(str(TEMP_WAV), "wb")
-                ww.setnchannels(1)
-                ww.setsampwidth(SAMPLE_WIDTH)
-                ww.setframerate(16000)         # merged file @ 16 kHz mono
-                self.wav_writer = ww
-                self.recording = True
-                self.audio_start_epoch = time.time()
-                self.recording_path = str(TEMP_WAV)
-                self.samples_written = 0
-                self._audio_time_last = 0.0
-                self.ui_log.emit(f"Audio: recording started → {TEMP_WAV.name}")
-                self.recording_started.emit(self.audio_start_epoch)
-            except Exception as e:
-                self.wav_writer = None
-                self.recording = False
-                logging.getLogger("transcriber").exception(f"Auto record start failed: {e}")
-
-        # ----------------- Device change handlers -----------------
-        def on_mic_changed(self, _i):
-            # Debounce rapid changes
-            if not self.device_switch_lock.acquire(blocking=False):
-                return
-            QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=True, reopen_spk=False))
-
-        def on_spk_changed(self, _i):
-            if not self.device_switch_lock.acquire(blocking=False):
-                return
-            QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=False, reopen_spk=True))
-
-        def _safe_switch(self, reopen_mic=False, reopen_spk=False):
-            try:
-                self.suspend_transcription.set()
-                self.status_label.setText("Status: Switching device(s)…")
-                QtCore.QCoreApplication.processEvents()
-
-                # Pause loop cleanly
-                self.stop_event.set()
-                t = self.audio_thread
-                if t and t.is_alive():
-                    t.join(timeout=1.0)  # short wait; loop exits fast
-
-                # Close selected streams only
                 with self.opening_lock:
+                    mic_dev = self.mic_combo.currentData()
+                    spk_dev = self.spk_combo.currentData()
+                    mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
+                    spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
                     with self.stream_lock:
-                        if reopen_mic and self.stream_mic:
-                            try: self.stream_mic.stop_stream()
-                            except Exception: pass
-                            try: self.stream_mic.close()
-                            except Exception: pass
-                            self.stream_mic = None
-                        if reopen_spk and self.stream_spk:
-                            try: self.stream_spk.stop_stream()
-                            except Exception: pass
-                            try: self.stream_spk.close()
-                            except Exception: pass
-                            self.stream_spk = None
+                        self.stream_mic = mic_state["stream"] if mic_state else None
+                        self.stream_spk = spk_state["stream"] if spk_state else None
+                        self.mic_open = mic_state or {}
+                        self.spk_open = spk_state or {}
 
-                # Reopen requested sides
-                with self.opening_lock:
-                    if reopen_mic:
-                        mic_dev = self._current_combo_data(self.mic_combo)
-                        mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
-                        with self.stream_lock:
-                            self.stream_mic = mic_state["stream"] if mic_state else None
-                            self.mic_open = mic_state or {}
-                    if reopen_spk:
-                        spk_dev = self._current_combo_data(self.spk_combo)
-                        spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
-                        with self.stream_lock:
-                            self.stream_spk = spk_state["stream"] if spk_state else None
-                            self.spk_open = spk_state or {}
+                if not self.stream_mic and not self.stream_spk:
+                    self.status_label.setText("Status: No input streams. Pick Mic and/or Speaker.")
+                    self.copy_button.setEnabled(bool(self.transcript_lines))
+                    return
 
-                # If neither reopened successfully, keep running with whatever we have (or idle).
+                # Begin recording to a 16 kHz mono WAV (merged)
+                self.begin_recording_if_ready()
+
                 self.stop_event.clear()
                 self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
                 self.audio_thread.start()
-                self.status_label.setText("Status: Device(s) switched.")
+                self._log_ui("Audio: streams opened and audio thread started (dual-capable).")
+                self.copy_button.setEnabled(True)
             except Exception:
-                log.exception("Device switch failed")
-                self.status_label.setText("Status: Device switch failed (see log).")
-            finally:
-                self.suspend_transcription.clear()
-                try: self.device_switch_lock.release()
-                except Exception: pass
+                log.exception("start_audio_thread: error")
 
-                # ----------------- Audio loop (dual source) -----------------
-                def audio_loop(self):
-                    self._log_ui("Audio: loop entered (dual-source)")
-                    VAD_SR = 16000
-                    VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
+        QtCore.QTimer.singleShot(0, open_and_run)
 
-                    def to_mono_i16(raw, ch):
-                        if not raw:
-                            return None
-                        try:
-                            x = np.frombuffer(raw, dtype=np.int16)
-                            ch = max(1, int(ch or 1))
-                            if ch > 1:
-                                x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
-                            return x
-                        except Exception:
-                            return None
+    def begin_recording_if_ready(self):
+        if self.recording:
+            return
+        _ensure_dir(TEMP_DIR); _ensure_dir(TEMP_FRAMES)
+        try:
+            ww = wave.open(str(TEMP_WAV), "wb")
+            ww.setnchannels(1)
+            ww.setsampwidth(SAMPLE_WIDTH)
+            ww.setframerate(16000)         # merged file @ 16 kHz mono
+            self.wav_writer = ww
+            self.recording = True
+            self.audio_start_epoch = time.time()
+            self.recording_path = str(TEMP_WAV)
+            self.samples_written = 0
+            self._audio_time_last = 0.0
+            self.ui_log.emit(f"Audio: recording started → {TEMP_WAV.name}")
+            self.recording_started.emit(self.audio_start_epoch)
+        except Exception as e:
+            self.wav_writer = None
+            self.recording = False
+            logging.getLogger("transcriber").exception(f"Auto record start failed: {e}")
 
-                    def i16_to_f32(x):
-                        return (x.astype(np.float32) / 32768.0) if x is not None and x.size else None
+    def _safe_switch(self, reopen_mic=False, reopen_spk=False):
+        try:
+            self.suspend_transcription.set()
+            self.status_label.setText("Status: Switching device(s)…")
+            QtCore.QCoreApplication.processEvents()
 
-                    def rms_db(x):
-                        if x is None or not x.size:
-                            return -120.0
-                        r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)) + 1e-12)
-                        return 20.0 * math.log10(r + 1e-20)
+            # Pause loop cleanly
+            self.stop_event.set()
+            t = self.audio_thread
+            if t and t.is_alive():
+                t.join(timeout=1.0)  # short wait; loop exits fast
 
-                    # local snapshots of streams/params
+            # Close selected streams only
+            with self.opening_lock:
+                with self.stream_lock:
+                    if reopen_mic and self.stream_mic:
+                        try: self.stream_mic.stop_stream()
+                        except Exception: pass
+                        try: self.stream_mic.close()
+                        except Exception: pass
+                        self.stream_mic = None
+                    if reopen_spk and self.stream_spk:
+                        try: self.stream_spk.stop_stream()
+                        except Exception: pass
+                        try: self.stream_spk.close()
+                        except Exception: pass
+                        self.stream_spk = None
+
+            # Reopen requested sides
+            with self.opening_lock:
+                if reopen_mic:
+                    mic_dev = self._current_combo_data(self.mic_combo)
+                    mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
                     with self.stream_lock:
-                        s_m = getattr(self, "stream_mic", None)
-                        s_s = getattr(self, "stream_spk", None)
-                    m_state = dict(getattr(self, "mic_open", {}) or {})
-                    s_state = dict(getattr(self, "spk_open", {}) or {})
+                        self.stream_mic = mic_state["stream"] if mic_state else None
+                        self.mic_open = mic_state or {}
+                if reopen_spk:
+                    spk_dev = self._current_combo_data(self.spk_combo)
+                    spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
+                    with self.stream_lock:
+                        self.stream_spk = spk_state["stream"] if spk_state else None
+                        self.spk_open = spk_state or {}
 
-                    # frames-per-buffer per device
-                    m_fpb = int(m_state.get("fpb", 0) or 0)
-                    s_fpb = int(s_state.get("fpb", 0) or 0)
+            # If neither reopened successfully, keep running with whatever we have (or idle).
+            self.stop_event.clear()
+            self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
+            self.audio_thread.start()
+            self.status_label.setText("Status: Device(s) switched.")
+        except Exception:
+            log.exception("Device switch failed")
+            self.status_label.setText("Status: Device switch failed (see log).")
+        finally:
+            self.suspend_transcription.clear()
+            try: self.device_switch_lock.release()
+            except Exception: pass
 
-                    while not self.stop_event.is_set():
-                        # Pull a block from each *if available*
-                        mic_block = None
-                        spk_block = None
+    # ----------------- Audio loop (dual source) -----------------
+    def audio_loop(self):
+        self._log_ui("Audio: loop entered (dual-source)")
+        VAD_SR = 16000
+        VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
 
-                        with self.stream_lock:
-                            s_m = getattr(self, "stream_mic", None)
-                            s_s = getattr(self, "stream_spk", None)
+        def to_mono_i16(raw, ch):
+            if not raw:
+                return None
+            try:
+                x = np.frombuffer(raw, dtype=np.int16)
+                ch = max(1, int(ch or 1))
+                if ch > 1:
+                    x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
+                return x
+            except Exception:
+                return None
 
-                        try:
-                            if s_m and s_m.is_active() and m_fpb > 0:
-                                mic_block = s_m.read(m_fpb, exception_on_overflow=False)
-                                self.mic_bytes_total += len(mic_block or b"")
-                        except Exception:
-                            mic_block = None
+        def i16_to_f32(x):
+            return (x.astype(np.float32) / 32768.0) if x is not None and x.size else None
 
-                        try:
-                            if s_s and s_s.is_active() and s_fpb > 0:
-                                spk_block = s_s.read(s_fpb, exception_on_overflow=False)
-                                self.spk_bytes_total += len(spk_block or b"")
-                        except Exception:
-                            spk_block = None
+        def rms_db(x):
+            if x is None or not x.size:
+                return -120.0
+            r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)) + 1e-12)
+            return 20.0 * math.log10(r + 1e-20)
 
-                        # Convert to mono i16
-                        mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
-                        spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
+        # local snapshots of streams/params
+        with self.stream_lock:
+            s_m = getattr(self, "stream_mic", None)
+            s_s = getattr(self, "stream_spk", None)
+        m_state = dict(getattr(self, "mic_open", {}) or {})
+        s_state = dict(getattr(self, "spk_open", {}) or {})
 
-                        # Resample to 16k float32 for VAD + mix
-                        m_sr = int(m_state.get("sr", 16000) or 16000)
-                        s_sr = int(s_state.get("sr", 16000) or 16000)
-                        mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
-                        spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
+        # frames-per-buffer per device
+        m_fpb = int(m_state.get("fpb", 0) or 0)
+        s_fpb = int(s_state.get("fpb", 0) or 0)
 
-                        # Log meters occasionally so we can see if mic is alive
-                        now = time.time()
-                        if now - self.last_meter_log > 5.0:
-                            db_m = rms_db(mic_f) if mic_f is not None else -120.0
-                            db_s = rms_db(spk_f) if spk_f is not None else -120.0
-                            self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
-                                         f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
-                            self.last_meter_log = now
+        while not self.stop_event.is_set():
+            # Pull a block from each *if available*
+            mic_block = None
+            spk_block = None
 
-                        # Per-source VAD (use last 30ms of each if present)
-                        def vad_last30(xf):
-                            if xf is None or xf.size < VAD_SAMPLES_30MS:
-                                return False
-                            # convert float back to int16 for webrtcvad
-                            y16 = np.clip(np.round(xf[-VAD_SAMPLES_30MS:]*32768.0), -32768, 32767).astype(np.int16)
-                            try:
-                                return self.vad.is_speech(y16.tobytes(), VAD_SR)
-                            except Exception:
-                                return False
+            with self.stream_lock:
+                s_m = getattr(self, "stream_mic", None)
+                s_s = getattr(self, "stream_spk", None)
 
-                        mic_speech = vad_last30(mic_f)
-                        spk_speech = vad_last30(spk_f)
+            try:
+                if s_m and s_m.is_active() and m_fpb > 0:
+                    mic_block = s_m.read(m_fpb, exception_on_overflow=False)
+                    self.mic_bytes_total += len(mic_block or b"")
+            except Exception:
+                mic_block = None
 
-                        # Build the mixed float32 16k chunk (align lengths)
-                        mix = None
-                        if mic_f is not None and spk_f is not None:
-                            n = min(mic_f.size, spk_f.size)
-                            if n > 0:
-                                mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
-                                # prevent clipping
-                                mix = np.clip(mix, -1.0, 1.0)
-                        elif mic_f is not None:
-                            mix = self.mix_mic_gain * mic_f
-                        elif spk_f is not None:
-                            mix = self.mix_spk_gain * spk_f
+            try:
+                if s_s and s_s.is_active() and s_fpb > 0:
+                    spk_block = s_s.read(s_fpb, exception_on_overflow=False)
+                    self.spk_bytes_total += len(spk_block or b"")
+            except Exception:
+                spk_block = None
 
-                        # Append mixed audio to the transcription buffer in raw int16 (16k)
-                        if mix is not None and mix.size:
-                            i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
-                            with self.buffer_lock:
-                                self.buffer.append(i16)
+            # Convert to mono i16
+            mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
+            spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
 
-                        # UI + scheduling
-                        if mic_speech or spk_speech:
-                            QtCore.QMetaObject.invokeMethod(
-                                self.status_label, "setText", Qt.QueuedConnection,
-                                QtCore.Q_ARG(str, "Status: Listening…")
-                            )
-                            self.was_speech = True
-                            # trigger immediately when either talks
+            # Resample to 16k float32 for VAD + mix
+            m_sr = int(m_state.get("sr", 16000) or 16000)
+            s_sr = int(s_state.get("sr", 16000) or 16000)
+            mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
+            spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
+
+            # Log meters occasionally so we can see if mic is alive
+            now = time.time()
+            if now - self.last_meter_log > 5.0:
+                db_m = rms_db(mic_f) if mic_f is not None else -120.0
+                db_s = rms_db(spk_f) if spk_f is not None else -120.0
+                self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
+                             f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
+                self.last_meter_log = now
+
+            # Per-source VAD (use last 30ms of each if present)
+            def vad_last30(xf):
+                if xf is None or xf.size < VAD_SAMPLES_30MS:
+                    return False
+                # convert float back to int16 for webrtcvad
+                y16 = np.clip(np.round(xf[-VAD_SAMPLES_30MS:]*32768.0), -32768, 32767).astype(np.int16)
+                try:
+                    return self.vad.is_speech(y16.tobytes(), VAD_SR)
+                except Exception:
+                    return False
+
+            mic_speech = vad_last30(mic_f)
+            spk_speech = vad_last30(spk_f)
+
+            # Build the mixed float32 16k chunk (align lengths)
+            mix = None
+            if mic_f is not None and spk_f is not None:
+                n = min(mic_f.size, spk_f.size)
+                if n > 0:
+                    mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
+                    # prevent clipping
+                    mix = np.clip(mix, -1.0, 1.0)
+            elif mic_f is not None:
+                mix = self.mix_mic_gain * mic_f
+            elif spk_f is not None:
+                mix = self.mix_spk_gain * spk_f
+
+            # Append mixed audio to the transcription buffer in raw int16 (16k)
+            if mix is not None and mix.size:
+                i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
+                with self.buffer_lock:
+                    self.buffer.append(i16)
+
+            # UI + scheduling
+            if mic_speech or spk_speech:
+                QtCore.QMetaObject.invokeMethod(
+                    self.status_label, "setText", Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, "Status: Listening…")
+                )
+                self.was_speech = True
+                # trigger immediately when either talks
+                self._try_schedule_transcription()
+                # Hint for tagging (which source spoke last)
+                if mic_speech:
+                    self.transcription_hints.append("[MIC]")
+                if spk_speech:
+                    self.transcription_hints.append("[SPK]")
+            else:
+                if self.was_speech:
+                    self.was_speech = False
+                    QtCore.QMetaObject.invokeMethod(
+                        self.status_label, "setText", Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, "Status: Silent")
+                    )
+                # time-based fallback: if buffer has data, flush every few seconds
+                if (now - self.last_transcription_time) > self.force_transcription_interval:
+                    with self.buffer_lock:
+                        if len(self.buffer) > 0:
                             self._try_schedule_transcription()
-                            # Hint for tagging (which source spoke last)
-                            if mic_speech:
-                                self.transcription_hints.append("[MIC]")
-                            if spk_speech:
-                                self.transcription_hints.append("[SPK]")
-                        else:
-                            if self.was_speech:
-                                self.was_speech = False
-                                QtCore.QMetaObject.invokeMethod(
-                                    self.status_label, "setText", Qt.QueuedConnection,
-                                    QtCore.Q_ARG(str, "Status: Silent")
-                                )
-                            # time-based fallback: if buffer has data, flush every few seconds
-                            if (now - self.last_transcription_time) > self.force_transcription_interval:
-                                with self.buffer_lock:
-                                    if len(self.buffer) > 0:
-                                        self._try_schedule_transcription()
 
-                        time.sleep(0.002)
+            time.sleep(0.002)
 
     # ----------------- Transcription -----------------
     def _try_schedule_transcription(self):
@@ -1828,6 +1813,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("Speech model loaded (faster-whisper).")
         except Exception:
             logging.getLogger("transcriber").exception("Error finalizing model load.")
+
+    def flush_pending_transcription(self):
+        """Force a last transcription pass if there’s buffered audio."""
+        if self.transcription_in_progress.is_set():
+            return
+        with self.buffer_lock:
+            has = len(self.buffer) > 0
+        if has:
+            self._try_schedule_transcription()
+            # Optional: brief wait so the background thread can finish a small chunk
+            time.sleep(0.2)
 
     def _build_loading_banner(self):
         bar = QtWidgets.QFrame()
