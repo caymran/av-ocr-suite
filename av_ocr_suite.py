@@ -1619,12 +1619,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 mic_bytes    = b"".join(self.buffer_mic); self.buffer_mic.clear()
                 spk_bytes    = b"".join(self.buffer_spk); self.buffer_spk.clear()
 
-            # We’re going to process; NOW clear the buffers
-            with self.buffer_lock:
-                self.buffer.clear()
-                self.buffer_mic.clear()
-                self.buffer_spk.clear()
-
             # --- convert to float32 16k for the model as you already do ---
             merged_f32_16k = i16_bytes_to_f32_16k(merged_bytes, 16000) if merged_bytes else np.zeros(0, np.float32)
             mic_f32_16k    = i16_bytes_to_f32_16k(mic_bytes,    16000) if mic_bytes    else np.zeros(0, np.float32)
