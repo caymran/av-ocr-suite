@@ -836,46 +836,44 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         self._do_ocr_and_emit(img, reason=f"change {change_ratio:.2%}")
         self.prev_gray = curr_gray; self.prev_size = sz
 
+    # at __init__ of ScreenOCRWidget
+    self.pool = QtCore.QThreadPool.globalInstance()
+
     def _do_ocr_and_emit(self, img: QtGui.QImage, reason: str):
         if self.hwnd is None:
             self.status.setText("Default black preview (no window selected).")
             return
-
-        try:
-            self.frame_captured.emit(img)
-        except Exception:
-            pass
-        try:
-            if not USE_TESS:
-                self.status.setText("OCR disabled (no Tesseract). Frames still archived.")
-                return
-            import pytesseract
-            from PIL import Image
-        except Exception:
-            self.status.setText("OCR disabled (pytesseract/PIL not available).")
+        self.frame_captured.emit(img)
+        if not USE_TESS:
+            self.status.setText("OCR disabled (no Tesseract). Frames still archived.")
             return
-        try:
-            img_rgba = img.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
-            width, height = img_rgba.width(), img_rgba.height()
-            ptr = img_rgba.bits(); ptr.setsize(img_rgba.sizeInBytes())
-            pil = Image.frombuffer("RGBA", (width, height), bytes(ptr), "raw", "RGBA", 0, 1)
-            text = pytesseract.image_to_string(pil).strip()
-        except Exception as e:
-            text = ""
-            self._log(f"[error] OCR: {e}")
 
+        class OCRTask(QtCore.QRunnable):
+            def run(_):
+                try:
+                    img_rgba = img.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+                    w,h = img_rgba.width(), img_rgba.height()
+                    ptr = img_rgba.bits(); ptr.setsize(img_rgba.sizeInBytes())
+                    pil = Image.frombuffer("RGBA", (w, h), bytes(ptr), "raw", "RGBA", 0, 1)
+                    text = pytesseract.image_to_string(pil, config="--oem 3 --psm 6").strip()
+                except Exception as e:
+                    text = ""
+                    self._log(f"[error] OCR: {e}")
+                QtCore.QMetaObject.invokeMethod(self, "_apply_ocr_text", Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, text), Qt.Q_ARG(str, reason))
+
+        self.pool.start(OCRTask())
+
+    @QtCore.pyqtSlot(str, str)
+    def _apply_ocr_text(self, text: str, reason: str):
         ts = datetime.now().strftime("%H:%M:%S")
         if text:
             line = f"[{ts}] {text}"
             self.ocr_lines.append(line)
             self.text_edit.appendPlainText(line)
             self.status.setText(f"OCR appended ({reason}).")
-            if self.debug_chk.isChecked():
-                self._log(f"[ocr] appended len={len(text)} ({reason})")
         else:
             self.status.setText(f"OCR empty ({reason}).")
-            if self.debug_chk.isChecked():
-                self._log(f"[ocr] empty ({reason})")
 
     def get_ocr_text(self) -> str:
         return "\n".join(self.ocr_lines)
@@ -1454,14 +1452,13 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             # Per-source VAD (use last 30ms of each if present)
             def vad_last30(xf):
-                if xf is None or xf.size < VAD_SAMPLES_30MS:
-                    return False
-                # convert float back to int16 for webrtcvad
-                y16 = np.clip(np.round(xf[-VAD_SAMPLES_30MS:]*32768.0), -32768, 32767).astype(np.int16)
-                try:
-                    return self.vad.is_speech(y16.tobytes(), VAD_SR)
-                except Exception:
-                    return False
+                if xf is None: return False
+                need = 16000 // (1000 // 30)  # 480
+                if xf.size < need: return False
+                y = xf[-need:]
+                y16 = np.clip(np.round(y*32768), -32768, 32767).astype(np.int16)
+                try: return self.vad.is_speech(y16.tobytes(), 16000)
+                except: return False
 
             now = time.time()
             if not hasattr(self, "_last_buf_log"):
