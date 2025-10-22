@@ -123,14 +123,12 @@ import pyaudiowpatch as pyaudio
 
 # --- ensure PyInstaller bundles OCR deps (no-op if missing) ---
 try:
-    import pytesseract  # noqa: F401
-    from PIL import Image  # noqa: F401
+    import pytesseract
+    from PIL import Image
 except Exception:
+    pytesseract = None
     Image = None
-
-if Image is None:
-    self._log("[warn] OCR skipped: Pillow not available")
-    return
+    
     
 # Qt
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -173,13 +171,14 @@ def _frozen_base_dir() -> Path:
 def _enable_tesseract_if_present():
     """Wire up pytesseract if Tesseract is installed or bundled, and add its dir to PATH."""
     try:
-        import pytesseract
-        from shutil import which
+        # If Pillow/pytesseract aren't importable, just disable OCR cleanly.
+        if pytesseract is None or Image is None:
+            log.info("Pillow/pytesseract not available; OCR disabled.")
+            return
 
-        # 1) PATH
+        from shutil import which
         tcmd = which("tesseract")
 
-        # 2) Bundled locations
         candidates = [
             EXE_DIR / "tesseract" / "tesseract.exe",
             CWD / "tesseract" / "tesseract.exe",
@@ -193,7 +192,6 @@ def _enable_tesseract_if_present():
 
         if tcmd:
             tdir = str(Path(tcmd).parent)
-            # Prepend so our bundled copy wins
             os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
             pytesseract.pytesseract.tesseract_cmd = tcmd
             global USE_TESS
@@ -845,8 +843,8 @@ class ScreenOCRWidget(QtWidgets.QWidget):
             self.status.setText("Default black preview (no window selected).")
             return
         self.frame_captured.emit(img)
-        if not USE_TESS:
-            self.status.setText("OCR disabled (no Tesseract). Frames still archived.")
+        if not (USE_TESS and pytesseract and Image):
+            self.status.setText("OCR disabled (no Tesseract/Pillow). Frames still archived.")
             return
 
         class OCRTask(QtCore.QRunnable):
