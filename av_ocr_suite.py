@@ -1702,9 +1702,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
 
     # ----------------- Misc (unchanged-ish) -----------------
-    def _log_ui(self, msg: str):
-        try: self._ui_log(msg)
-        except Exception: pass
+    def _log_ui(self, msg):
+        QtCore.QMetaObject.invokeMethod(
+            self.parent_window, "_append_log",
+            Qt.QueuedConnection, QtCore.Q_ARG(str, msg)
+        )
 
     def _write_audio_line(self, line: str):
         self.transcript_lines.append(line)
@@ -2092,6 +2094,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, line: str, from_logger: bool = False):
         if not hasattr(self, "log_edit") or self.log_edit is None:
             return
+        if "Transcribe scheduled" in msg or "buf=" in msg:
+            if not self.debug:
+                return
         QtCore.QMetaObject.invokeMethod(
             self.log_edit, "appendPlainText",
             Qt.QueuedConnection, QtCore.Q_ARG(str, line)
@@ -2489,6 +2494,15 @@ if __name__ == "__main__":
 
         log.info(f"Run output dir: {RUN_DIR}")
         log.info(f"Temp dir: {TEMP_DIR}")
+
+
+        import threading, faulthandler
+        faulthandler.enable()
+        def ping_gui():
+            print("[Ping] GUI thread alive:", threading.current_thread().name)
+            QtCore.QTimer.singleShot(1000, ping_gui)
+        QtCore.QTimer.singleShot(1000, ping_gui)
+
 
         sys.exit(app.exec_())
 
