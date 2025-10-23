@@ -110,6 +110,12 @@ from threading import Thread, Event, Lock
 from collections import deque
 from contextlib import contextmanager
 
+# --- mic mute/status ---
+import comtypes
+import comtypes.client
+from comtypes import GUID
+from ctypes import POINTER, c_float, HRESULT, wintypes
+
 # --- keep warnings hush for frozen builds etc. ---
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=r"pkg_resources is deprecated as an API.*")
@@ -550,6 +556,7 @@ def get_pid(hwnd: int) -> int:
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
 
+
 def _get_extended_frame_bounds(hwnd: int) -> wintypes.RECT:
     DWMWA_EXTENDED_FRAME_BOUNDS = 9
     rect = wintypes.RECT()
@@ -881,6 +888,99 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         try: self.timer.stop()
         except Exception: pass
 
+# ---- CoreAudio capture mute monitor (default device) ----
+CLSID_MMDeviceEnumerator = GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+IID_IMMDeviceEnumerator   = GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
+IID_IAudioEndpointVolume  = GUID('{5CDF2C82-841E-4546-9722-0CF74078229A}')
+eCapture = 1  # dataFlow
+eConsole = 0  # role
+
+class IAudioEndpointVolumeCallback(comtypes.IUnknown):
+    _iid_ = GUID('{657804FA-D6AD-4496-8A60-352752AF4F89}')
+    _methods_ = [comtypes.COMMETHOD([], HRESULT, 'OnNotify',
+                  (['in'], wintypes.LPVOID, 'pNotify'))]
+
+def _get_endpoint_volume():
+    mmde = comtypes.client.CreateObject(CLSID_MMDeviceEnumerator, interface=comtypes.gen.MMDeviceApiLib.IMMDeviceEnumerator)
+    dev = mmde.GetDefaultAudioEndpoint(eCapture, eConsole)
+    epv = dev.Activate(IID_IAudioEndpointVolume, comtypes.CLSCTX_ALL, None,
+                       interface=comtypes.gen.AudioEndpointVolumeLib.IAudioEndpointVolume)
+    return epv
+
+def read_device_mute_now() -> bool:
+    try:
+        epv = _get_endpoint_volume()
+        return bool(epv.GetMute())
+    except Exception:
+        return False
+
+def watch_device_mute(mute_event: Event, stop_event: Event):
+    """
+    Polling watcher (simple/reliable). You can implement callback registration,
+    but polling every ~300ms is plenty and avoids COM callback boilerplate.
+    """
+    last = None
+    while not stop_event.is_set():
+        try:
+            cur = read_device_mute_now()
+            if cur != last:
+                last = cur
+                if cur:
+                    mute_event.set()
+                else:
+                    mute_event.clear()
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+
+# ---- Teams UI mute watcher (UIA) ----
+def watch_teams_mute(mute_event: Event, stop_event: Event):
+    """
+    Polls the Teams main window and inspects the mute/unmute button.
+    If the UI shows 'Unmute' (meaning currently muted), we set the event.
+    """
+    try:
+        from pywinauto import Desktop
+    except Exception:
+        logging.getLogger("transcriber").warning("Teams watcher: pywinauto not available; skipping.")
+        return
+
+    desktop = Desktop(backend="uia")
+    last = None
+    while not stop_event.is_set():
+        cur = None
+        try:
+            # Try both classic ('Microsoft Teams') and new ('Microsoft Teams (work or school)') window names.
+            wins = [w for w in desktop.windows() if 'teams' in (w.window_text() or '').lower()]
+            if wins:
+                wnd = wins[0]
+                # Look for a toggle-type control. Names vary:
+                # Common patterns: 'Mute', 'Unmute', 'Microphone', tooltip variations.
+                mutes = wnd.descendants(control_type="Button")
+                label = ""
+                for btn in mutes:
+                    txt = (btn.window_text() or "").strip().lower()
+                    if any(k in txt for k in ("mute", "unmute", "microphone")):
+                        label = txt
+                        break
+                if label:
+                    # Heuristic: if button label says 'Unmute', user is muted right now (press to unmute)
+                    # If it says 'Mute', user is UNmuted (press to mute).
+                    cur = ('unmute' in label)  # True means muted
+        except Exception:
+            cur = None
+
+        if cur is not None and cur != last:
+            last = cur
+            if cur:
+                mute_event.set()
+            else:
+                mute_event.clear()
+
+        time.sleep(0.5)
+
+
 # ======================
 #     Audio Widget
 # ======================
@@ -895,6 +995,19 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self._ui_log = log_fn or (lambda s: None)  # keep if you still want a raw callable
         self.ui_log.connect(self._relay_log)       # <-- use the Qt slot relay instead
         self._get_ocr_transcript = get_ocr_transcript_fn or (lambda: "")
+
+        self.muted_device = Event()     # reflects device/global mute
+        self.muted_teams  = Event()     # reflects Teams UI mute (optional)
+        self._mute_watch_stop = Event()
+
+        # Start watchers
+        Thread(target=watch_device_mute, args=(self.muted_device, self._mute_watch_stop),
+               name="MuteWatchDevice", daemon=True).start()
+
+        # Optional Teams watcher
+        Thread(target=watch_teams_mute, args=(self.muted_teams, self._mute_watch_stop),
+               name="MuteWatchTeams", daemon=True).start()
+
 
         self.debug = DEBUG_MODE
         self.mic_bytes_total = 0
@@ -966,7 +1079,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self.force_timer.start()
 
         log.info("Audio widget init; dual-source audio thread will start soon.")
-
+        
+        
+   
+        
     # ----------------- UI -----------------
     def init_ui(self):
         self.status_label = QtWidgets.QLabel("Status: Silent")
@@ -1034,6 +1150,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         except Exception:
             logging.getLogger("transcriber").exception("UI log relay failed")
 
+    def _is_externally_muted(self) -> bool:
+        # If either source says “muted”, treat as muted.
+        return self.muted_device.is_set() or self.muted_teams.is_set()
+     
 
     def _prefer_index(self, items, *needles):
         """
@@ -1508,7 +1628,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             if mic_speech or spk_speech:
                 self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
 
-
+            muted = self._is_externally_muted()
+            QtCore.QMetaObject.invokeMethod(
+                self.status_label, "setText", Qt.QueuedConnection,
+                QtCore.Q_ARG(str, "Status: Muted (following Teams/device)" if muted else "Status: Listening…")
+            )
 
             # Build the mixed float32 16k chunk (align lengths)
             mix = None
@@ -1547,9 +1671,15 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             # (A) VAD activity branch
             if mic_speech or spk_speech:
-                QtCore.QTimer.singleShot(0, self._try_schedule_transcription)   # was: self._try_schedule_transcription()
-                self._log_ui("Transcribe scheduled: VAD activity")
-                if mic_speech:
+                self.was_speech = True
+                if ((not self._is_externally_muted()) or spk_speech):
+                    QtCore.QTimer.singleShot(0, self._try_schedule_transcription)   # was: self._try_schedule_transcription()
+                    self._log_ui("Transcribe scheduled: VAD activity")
+                else:
+                    self._log_ui("Muted externally → skip scheduling on VAD")
+                if mic_speech and self._is_externally_muted():
+                    self.transcription_hints.append("[MIC - Muted]")
+                if mic_speech and not self._is_externally_muted():
                     self.transcription_hints.append("[MIC]")
                 if spk_speech:
                     self.transcription_hints.append("[SPK]")
@@ -1564,9 +1694,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     )
                 if (now - self.last_transcription_time) > self.force_transcription_interval:
                     with self.buffer_lock:
-                        if len(self.buffer) > 0:
-                            QtCore.QTimer.singleShot(0, self._try_schedule_transcription)  # was: self._try_schedule_transcription()
-                            self._log_ui("Transcribe scheduled: Force due to duration of audio")
+                        have_any = len(self.buffer) > 0
+                    if have_any and not self._is_externally_muted():
+                        QtCore.QTimer.singleShot(0, self._try_schedule_transcription)
+                        self._log_ui("Transcribe scheduled: Force due to duration of audio")
 
             time.sleep(0.002)
 
@@ -1833,6 +1964,12 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     self.force_timer.stop()
             except Exception:
                 logging.getLogger("transcriber").exception("Audio force_timer stop failed")
+
+            try:
+                if hasattr(self, "_mute_watch_stop"):
+                    self._mute_watch_stop.set()
+            except Exception:
+                pass
 
             # Close streams
             try:
