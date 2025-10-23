@@ -1478,10 +1478,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             if mic_speech or spk_speech:
                 self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
 
-            if mic_f is not None or spk_f is not None:
-                db_m = rms_db(mic_f) if mic_f is not None else -120.0
-                db_s = rms_db(spk_f) if spk_f is not None else -120.0
-                self._log_ui(f"VAD detail: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS")
+
 
             # Build the mixed float32 16k chunk (align lengths)
             mix = None
@@ -1870,14 +1867,17 @@ class MainWindow(QtWidgets.QMainWindow):
         def __init__(self, fn):
             super().__init__()
             self._fn = fn
-            self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            # You can keep a formatter for other handlers; we won’t use it here.
+
         def emit(self, record):
             if getattr(record, "from_ui", False):
                 return
             try:
-                self._fn(self.format(record))
+                # Use the raw message (no timestamp) and mark as coming from logger
+                self._fn(record.getMessage(), from_logger=True)
             except Exception:
                 pass
+
 
     def __init__(self, whisper_model):
         super().__init__()
@@ -2069,16 +2069,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_copy_all.clicked.connect(self._copy_all_logs)
         self.btn_clear_log.clicked.connect(self.log_edit.clear)
 
-    def _append_log(self, line: str):
-        # Always show in the UI
+    def _append_log(self, line: str, from_logger: bool = False):
+        # Show in the UI
         QtCore.QMetaObject.invokeMethod(
             self.log_edit,
             "appendPlainText",
             Qt.QueuedConnection,
             QtCore.Q_ARG(str, line)
         )
-        # NEW: also persist to the file logger without re-injecting into the UI.
-        logging.getLogger("transcriber").info(line, extra={"from_ui": True})
+
+        # ⛔️ Only forward to the file logger if this did NOT come from the logger already
+        if not from_logger:
+            logging.getLogger("transcriber").info(line, extra={"from_ui": True})
 
     def _copy_all_logs(self):
         txt = self.log_edit.toPlainText()
