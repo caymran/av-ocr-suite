@@ -1699,11 +1699,20 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
 
     # ----------------- Misc (unchanged-ish) -----------------
-    def _log_ui(self, msg):
-        QtCore.QMetaObject.invokeMethod(
-            self.parent_window, "_append_log",
-            Qt.QueuedConnection, QtCore.Q_ARG(str, msg)
-        )
+    def _log_ui(self, msg: str):
+        try:
+            parent = getattr(self, 'parent_window', None)
+            if parent is not None:
+                QtCore.QMetaObject.invokeMethod(
+                    parent, "_append_log",
+                    Qt.QueuedConnection, QtCore.Q_ARG(str, msg)
+                )
+            else:
+                # Fallback to file logger until parent is wired
+                logging.getLogger("transcriber").info(msg, extra={"from_ui": True})
+        except Exception:
+            logging.getLogger("transcriber").exception("UI log emit failed")
+
 
     def _write_audio_line(self, line: str):
         self.transcript_lines.append(line)
@@ -1938,6 +1947,8 @@ class MainWindow(QtWidgets.QMainWindow):
             log_fn=self._append_log,
             get_ocr_transcript_fn=self._get_ocr_transcript_text
         )
+        
+        self.audio_tab.parent_window = self 
 
         # Loading banner (text updated)
         self.loading_banner = self._build_loading_banner()
