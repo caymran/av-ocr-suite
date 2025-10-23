@@ -1077,6 +1077,17 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         log.info("Refreshing audio devices..."); safe_flush()
         try:
             with self.opening_lock:
+                # Close streams before recreating PyAudio
+                with self.stream_lock:
+                    for s in (self.stream_mic, self.stream_spk):
+                        if s:
+                            try: s.stop_stream()
+                            except Exception: pass
+                            try: s.close()
+                            except Exception: pass
+                    self.stream_mic = None
+                    self.stream_spk = None
+
                 try: self.pa.terminate()
                 except Exception: pass
                 self.pa = pyaudio.PyAudio()
@@ -1217,7 +1228,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             except Exception:
                 log.exception("start_audio_thread: error")
 
-        QtCore.QTimer.singleShot(0, open_and_run)
+        Thread(target=open_and_run, name="AudioOpen", daemon=True).start()
+
 
     def begin_recording_if_ready(self):
         if self.recording:
@@ -1251,7 +1263,11 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             self.stop_event.set()
             t = self.audio_thread
             if t and t.is_alive():
-                t.join(timeout=1.0)  # short wait; loop exits fast
+                deadline = time.time() + 1.0
+                while t.is_alive() and time.time() < deadline:
+                    QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+                    time.sleep(0.01)
+            # (don’t worry if it’s still alive; we’ll replace it shortly)
 
             # Close selected streams only
             with self.opening_lock:
@@ -1441,7 +1457,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             # Log meters occasionally so we can see if mic is alive
             now = time.time()
-            if now - self.last_meter_log > 5.0:
+            if self.debug and now - self.last_meter_log > 5.0:
                 db_m = rms_db(mic_f) if mic_f is not None else -120.0
                 db_s = rms_db(spk_f) if spk_f is not None else -120.0
                 self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
@@ -1452,9 +1468,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             # Per-source VAD (use last 30ms of each if present)
             def vad_last30(xf):
                 if xf is None: return False
-                need = 16000 // (1000 // 30)  # 480
-                if xf.size < need: return False
-                y = xf[-need:]
+                if xf.size < VAD_SAMPLES_30MS: return False
+                y = xf[-VAD_SAMPLES_30MS:]
                 y16 = np.clip(np.round(y*32768), -32768, 32767).astype(np.int16)
                 try: return self.vad.is_speech(y16.tobytes(), 16000)
                 except: return False
@@ -1830,11 +1845,15 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             # Join audio thread
             try:
+                self.stop_event.set()
                 t = self.audio_thread
                 if t and t.is_alive():
-                    t.join(timeout=0.5)
-                    if t.is_alive():
-                        logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
+                    deadline = time.time() + 1.0
+                    while t.is_alive() and time.time() < deadline:
+                        QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+                        time.sleep(0.01)
+                # (don’t worry if it’s still alive; we’ll replace it shortly)
+                logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
             except Exception:
                 logging.getLogger("transcriber").exception("Audio thread join failed")
 
@@ -2071,23 +2090,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _append_log(self, line: str, from_logger: bool = False):
-        # 1) Always push to UI safely
-        QtCore.QMetaObject.invokeMethod(
-            self.log_edit,
-            "appendPlainText",
-            Qt.QueuedConnection,
-            QtCore.Q_ARG(str, line)
-        )
-
-        # 2) If this came from the logging handler, DO NOT mirror back to logging
-        if from_logger:
+        if not hasattr(self, "log_edit") or self.log_edit is None:
             return
-
-        # 3) Mirror to file logger *asynchronously* to avoid re-entrancy deadlocks
-        def _mirror():
-            logging.getLogger("transcriber").info(line, extra={"from_ui": True})
-        QtCore.QTimer.singleShot(0, _mirror)
-
+        QtCore.QMetaObject.invokeMethod(
+            self.log_edit, "appendPlainText",
+            Qt.QueuedConnection, QtCore.Q_ARG(str, line)
+        )
+        
     def _copy_all_logs(self):
         txt = self.log_edit.toPlainText()
         QtWidgets.QApplication.clipboard().setText(txt)
@@ -2187,6 +2196,10 @@ class MainWindow(QtWidgets.QMainWindow):
             have_wav = wav_ok(wav_path)
             usable_frames = has_usable_frames()
 
+            if not _ffmpeg_exists():
+                self._append_log("[export] ffmpeg missing; cannot export MP4/MP3.")
+                return
+                
             if not usable_frames and not have_wav:
                 self._append_log("[export] Nothing to export (no frames and no wav).")
                 return
@@ -2225,7 +2238,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._append_log(f"[export] {e}")
             try:
-                QMessageBox.warning(self, "Archive Export", f"Could not export archive:\n{e}\n(Temp left in {TEMP_DIR})")
+                if not self._closing:
+                    QMessageBox.warning(self, "Archive Export", f"Could not export archive:\n{e}\n(Temp left in {TEMP_DIR})")
             except Exception:
                 pass
 
@@ -2466,7 +2480,11 @@ if __name__ == "__main__":
 
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
-
+                QtCore.QMetaObject.invokeMethod(
+                    window.loading_banner, "setVisible",
+                    Qt.QueuedConnection, QtCore.Q_ARG(bool, True)
+                )
+                
         Thread(target=_load_model_bg, name="FWModelLoader", daemon=True).start()
 
         log.info(f"Run output dir: {RUN_DIR}")
