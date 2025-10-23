@@ -892,8 +892,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
     def __init__(self, model, log_fn=None, get_ocr_transcript_fn=None):
         super().__init__()
         log.info("Entered AudioTranscriberWidget.__init__"); safe_flush()
-        self._ui_log = log_fn or (lambda s: None)
-        self.ui_log.connect(self._ui_log)
+        self._ui_log = log_fn or (lambda s: None)  # keep if you still want a raw callable
+        self.ui_log.connect(self._relay_log)       # <-- use the Qt slot relay instead
         self._get_ocr_transcript = get_ocr_transcript_fn or (lambda: "")
 
         self.debug = DEBUG_MODE
@@ -1019,6 +1019,21 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self.mic_combo.setEnabled(True)
         self.spk_combo.setEnabled(True)
         self.copy_button.setEnabled(False)
+
+    # inside AudioTranscriberWidget
+    @QtCore.pyqtSlot(str)
+    def _relay_log(self, line: str):
+        try:
+            parent = getattr(self, 'parent_window', None)
+            if parent is not None and hasattr(parent, "_append_log"):
+                # hop to GUI thread without needing a Qt-invokable Python method
+                QtCore.QTimer.singleShot(0, lambda l=line: parent._append_log(l))
+            else:
+                # fallback: file logger only (avoid UI loop recursion)
+                logging.getLogger("transcriber").info(line, extra={"from_ui": True})
+        except Exception:
+            logging.getLogger("transcriber").exception("UI log relay failed")
+
 
     def _prefer_index(self, items, *needles):
         """
@@ -1701,17 +1716,9 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
     # ----------------- Misc (unchanged-ish) -----------------
     def _log_ui(self, msg: str):
         try:
-            parent = getattr(self, 'parent_window', None)
-            if parent is not None:
-                QtCore.QMetaObject.invokeMethod(
-                    parent, "_append_log",
-                    Qt.QueuedConnection, QtCore.Q_ARG(str, msg)
-                )
-            else:
-                # Fallback to file logger until parent is wired
-                logging.getLogger("transcriber").info(msg, extra={"from_ui": True})
+            self.ui_log.emit(msg)  # thread-safe; queued to _relay_log on GUI thread
         except Exception:
-            logging.getLogger("transcriber").exception("UI log emit failed")
+            logging.getLogger("transcriber").info(msg, extra={"from_ui": True})
 
 
     def _write_audio_line(self, line: str):
