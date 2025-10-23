@@ -1867,18 +1867,18 @@ class MainWindow(QtWidgets.QMainWindow):
         def __init__(self, fn):
             super().__init__()
             self._fn = fn
-            # You can keep a formatter for other handlers; we won’t use it here.
+            # You can keep a formatter for file/console; we won't use it here.
 
         def emit(self, record):
+            # Ignore mirrored UI lines
             if getattr(record, "from_ui", False):
                 return
             try:
-                # Use the raw message (no timestamp) and mark as coming from logger
+                # Pass only the raw message to the UI, and mark the origin
                 self._fn(record.getMessage(), from_logger=True)
             except Exception:
                 pass
-
-
+                
     def __init__(self, whisper_model):
         super().__init__()
         self._closing = False
@@ -1952,7 +1952,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ui_handler.setLevel(logging.INFO)
         logging.getLogger("transcriber").addHandler(ui_handler)
         logging.getLogger("transcriber").setLevel(logging.INFO)
-        logging.getLogger("transcriber").propagate = True  # make sure exceptions go to file too
+        logging.getLogger("transcriber").propagate = False  # make sure exceptions go to file too
 
 
         self.ocr_tab.frame_captured.connect(self._on_frame_captured)
@@ -2069,8 +2069,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_copy_all.clicked.connect(self._copy_all_logs)
         self.btn_clear_log.clicked.connect(self.log_edit.clear)
 
+
     def _append_log(self, line: str, from_logger: bool = False):
-        # Show in the UI
+        # 1) Always push to UI safely
         QtCore.QMetaObject.invokeMethod(
             self.log_edit,
             "appendPlainText",
@@ -2078,9 +2079,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.Q_ARG(str, line)
         )
 
-        # ⛔️ Only forward to the file logger if this did NOT come from the logger already
-        if not from_logger:
+        # 2) If this came from the logging handler, DO NOT mirror back to logging
+        if from_logger:
+            return
+
+        # 3) Mirror to file logger *asynchronously* to avoid re-entrancy deadlocks
+        def _mirror():
             logging.getLogger("transcriber").info(line, extra={"from_ui": True})
+        QtCore.QTimer.singleShot(0, _mirror)
 
     def _copy_all_logs(self):
         txt = self.log_edit.toPlainText()
