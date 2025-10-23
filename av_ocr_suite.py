@@ -2091,13 +2091,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, line: str, from_logger: bool = False):
         if not hasattr(self, "log_edit") or self.log_edit is None:
             return
-        if "Transcribe scheduled" in msg or "buf=" in msg:
-            if not self.debug:
-                return
+        # only filter noisy lines when not in debug
+        try:
+            if not DEBUG_MODE:
+                if ("Transcribe scheduled" in line) or ("buf=" in line):
+                    return
+        except Exception:
+            pass
+
         QtCore.QMetaObject.invokeMethod(
             self.log_edit, "appendPlainText",
             Qt.QueuedConnection, QtCore.Q_ARG(str, line)
         )
+
         
     def _copy_all_logs(self):
         txt = self.log_edit.toPlainText()
