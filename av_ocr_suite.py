@@ -1528,20 +1528,18 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 self._log_ui(f"WAV write error → {type(e).__name__}: {e}")
 
             # UI + scheduling
+            # --- inside AudioTranscriberWidget.audio_loop() ---
+
+            # (A) VAD activity branch
             if mic_speech or spk_speech:
-                QtCore.QMetaObject.invokeMethod(
-                    self.status_label, "setText", Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, "Status: Listening…")
-                )
-                self.was_speech = True
-                # trigger immediately when either talks
-                self._try_schedule_transcription()
+                QtCore.QTimer.singleShot(0, self._try_schedule_transcription)   # was: self._try_schedule_transcription()
                 self._log_ui("Transcribe scheduled: VAD activity")
-                # Hint for tagging (which source spoke last)
                 if mic_speech:
                     self.transcription_hints.append("[MIC]")
                 if spk_speech:
                     self.transcription_hints.append("[SPK]")
+
+            # (B) Silent branch, time-based fallback
             else:
                 if self.was_speech:
                     self.was_speech = False
@@ -1549,11 +1547,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         self.status_label, "setText", Qt.QueuedConnection,
                         QtCore.Q_ARG(str, "Status: Silent")
                     )
-                # time-based fallback: if buffer has data, flush every few seconds
                 if (now - self.last_transcription_time) > self.force_transcription_interval:
                     with self.buffer_lock:
                         if len(self.buffer) > 0:
-                            self._try_schedule_transcription()
+                            QtCore.QTimer.singleShot(0, self._try_schedule_transcription)  # was: self._try_schedule_transcription()
                             self._log_ui("Transcribe scheduled: Force due to duration of audio")
 
             time.sleep(0.002)
