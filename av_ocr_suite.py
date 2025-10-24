@@ -1625,8 +1625,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             mic_speech = vad_last30(mic_f)
             spk_speech = vad_last30(spk_f)
 
-            if mic_speech or spk_speech:
-                self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
+#            if mic_speech or spk_speech:
+#                self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
 
             muted = self._is_externally_muted()
             QtCore.QMetaObject.invokeMethod(
@@ -1707,7 +1707,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             self._log_ui("Transcribe not scheduled: suspended")
             return
         if self.transcription_in_progress.is_set():
-            self._log_ui("Transcribe not scheduled: already in progress")
+            #self._log_ui("Transcribe not scheduled: already in progress")
             return
         if self.transcription_scheduled.is_set():
             self._log_ui("Transcribe not scheduled: already scheduled")
