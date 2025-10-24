@@ -1767,10 +1767,10 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
                 # Small sleep keeps CPU sane
                 time.sleep(0.002)
-    except Exception as e:
-        logging.getLogger("transcriber").exception(f"Audio loop crashed: {e}")
-        self._log_ui(f"Audio loop crashed: {type(e).__name__}: {e}")
-        
+        except Exception as e:
+            logging.getLogger("transcriber").exception(f"Audio loop crashed: {e}")
+            self._log_ui(f"Audio loop crashed: {type(e).__name__}: {e}")
+            
     # ----------------- Transcription -----------------
     def _try_schedule_transcription(self):
         if self.suspend_transcription.is_set():
