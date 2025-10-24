@@ -110,6 +110,12 @@ from threading import Thread, Event, Lock
 from collections import deque
 from contextlib import contextmanager
 
+# --- mic mute/status ---
+import comtypes
+import comtypes.client
+from comtypes import GUID
+from ctypes import POINTER, c_float, HRESULT, wintypes
+
 # --- keep warnings hush for frozen builds etc. ---
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=r"pkg_resources is deprecated as an API.*")
@@ -123,12 +129,13 @@ import pyaudiowpatch as pyaudio
 
 # --- ensure PyInstaller bundles OCR deps (no-op if missing) ---
 try:
-    import pytesseract  # noqa: F401
-    from PIL import Image  # noqa: F401
+    import pytesseract
+    from PIL import Image
 except Exception:
-    pass
-
-
+    pytesseract = None
+    Image = None
+    
+    
 # Qt
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QTabWidget, QMessageBox
@@ -170,13 +177,14 @@ def _frozen_base_dir() -> Path:
 def _enable_tesseract_if_present():
     """Wire up pytesseract if Tesseract is installed or bundled, and add its dir to PATH."""
     try:
-        import pytesseract
-        from shutil import which
+        # If Pillow/pytesseract aren't importable, just disable OCR cleanly.
+        if pytesseract is None or Image is None:
+            log.info("Pillow/pytesseract not available; OCR disabled.")
+            return
 
-        # 1) PATH
+        from shutil import which
         tcmd = which("tesseract")
 
-        # 2) Bundled locations
         candidates = [
             EXE_DIR / "tesseract" / "tesseract.exe",
             CWD / "tesseract" / "tesseract.exe",
@@ -190,7 +198,6 @@ def _enable_tesseract_if_present():
 
         if tcmd:
             tdir = str(Path(tcmd).parent)
-            # Prepend so our bundled copy wins
             os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
             pytesseract.pytesseract.tesseract_cmd = tcmd
             global USE_TESS
@@ -198,6 +205,8 @@ def _enable_tesseract_if_present():
             log.info(f"Tesseract enabled: {tcmd}")
         else:
             log.info("Tesseract not found; OCR disabled.")
+            log.info(f"Tesseract search: PATH which()={tcmd!s}")
+            log.info(f"Tesseract candidates: {candidates}")
     except Exception:
         log.exception("Failed to initialize Tesseract; OCR disabled.")
 
@@ -259,19 +268,34 @@ DEFAULT_PROMPT = (
 # ======================
 def setup_logging():
     logger = logging.getLogger("transcriber")
-    logger.setLevel(logging.INFO)
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    logger.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s")
+
     if sys.stdout:
         console = logging.StreamHandler(sys.stdout)
-        console.setLevel(logging.INFO)
-        console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        console.setLevel(level)
+        console.setFormatter(fmt)
         logger.addHandler(console)
+
     logfile = ROOT_LOGS / f"app_{STAMP}.log"
     fh = logging.FileHandler(logfile, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
+
     logger.info(f"Application log: {logfile}")
+    logger.info(f"Run stamp={STAMP} cwd={CWD}")
+    logger.info(f"Debug mode={DEBUG_MODE}")
+
+    # catch unhandled exceptions
+    def _excepthook(exctype, value, tb):
+        logger.exception("UNCAUGHT", exc_info=(exctype, value, tb))
+    sys.excepthook = _excepthook
+
     return logger
+
 
 log = setup_logging()
 
@@ -303,22 +327,6 @@ def _ffmpeg_exists() -> bool:
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
-
-def _resample_i16_for_vad(mono_i16: np.ndarray, src_sr: int, dst_sr: int) -> bytes:
-    """Quick/cheap linear resample int16 -> int16 for short VAD frames."""
-    if src_sr == dst_sr:
-        return mono_i16.tobytes()
-    x = mono_i16.astype(np.float32) / 32768.0
-    dur = x.size / float(src_sr)
-    if dur <= 0.0:
-        return b""
-    n_new = max(1, int(round(dur * dst_sr)))
-    t_old = np.linspace(0.0, dur, num=x.size, endpoint=False, dtype=np.float32)
-    t_new = np.linspace(0.0, dur, num=n_new,   endpoint=False, dtype=np.float32)
-    y = np.interp(t_new, t_old, x)
-    y16 = np.clip(np.round(y * 32768.0), -32768, 32767).astype(np.int16)
-    return y16.tobytes()
-
 
 def export_archive_build_video(frames_with_ts, wav_path=None, crf=28, output_path=None):
     """
@@ -401,6 +409,30 @@ def export_archive_build_video(frames_with_ts, wav_path=None, crf=28, output_pat
         raise RuntimeError(f"ffmpeg concat export failed (code {proc.returncode})")
 
 TARGET_SR = 16000
+
+# --- helpers for dual-source tagging and interleaving ---
+def interleave_tagged_segments(mic_segments, spk_segments):
+    tagged = []
+    for s in mic_segments:
+        if getattr(s, "text", "").strip():
+            tagged.append(("MIC", float(getattr(s, "start", 0.0)), s.text.strip()))
+    for s in spk_segments:
+        if getattr(s, "text", "").strip():
+            tagged.append(("SPK", float(getattr(s, "start", 0.0)), s.text.strip()))
+    tagged.sort(key=lambda t: t[1])
+    return [f"[{src}] {txt}" for (src, _, txt) in tagged]
+
+def i16_bytes_to_f32_16k(b, sr):
+    if not b:
+        return np.zeros(0, dtype=np.float32)
+    x = np.frombuffer(b, dtype=np.int16)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    mono = x.astype(np.float32) / 32768.0
+    if int(sr) == 16000:
+        return mono
+    return resample_to_16k(mono, int(sr))
+
 def resample_to_16k(x: np.ndarray, sr: int) -> np.ndarray:
     if x is None or x.size == 0:
         return np.zeros(0, dtype=np.float32)
@@ -523,6 +555,7 @@ def get_pid(hwnd: int) -> int:
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
+
 
 def _get_extended_frame_bounds(hwnd: int) -> wintypes.RECT:
     DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -679,7 +712,6 @@ class WindowPickerOverlay(QtWidgets.QWidget):
 class ScreenOCRWidget(QtWidgets.QWidget):
     frame_captured = QtCore.pyqtSignal(QtGui.QImage)
     meeting_name_updated = QtCore.pyqtSignal(str)
-
     def __init__(self, log_fn=None):
         super().__init__()
         self._ui_log = log_fn or (lambda s: None)
@@ -695,6 +727,8 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         self.threshold_spin = QtWidgets.QDoubleSpinBox(); self.threshold_spin.setRange(0.0, 1.0); self.threshold_spin.setSingleStep(0.01); self.threshold_spin.setValue(0.01); self.threshold_spin.setDecimals(2)
         self.delta_spin = QtWidgets.QSpinBox(); self.delta_spin.setRange(1, 255); self.delta_spin.setValue(15); self.delta_spin.setSuffix(" Δ")
         self.debug_chk = QtWidgets.QCheckBox("Debug to panel")
+
+        self.pool = QtCore.QThreadPool.globalInstance()
 
         opt_layout = QtWidgets.QHBoxLayout()
         for w in [QtWidgets.QLabel("Interval:"), self.interval_spin, QtWidgets.QLabel("Change ≥"), self.threshold_spin,
@@ -815,42 +849,37 @@ class ScreenOCRWidget(QtWidgets.QWidget):
         if self.hwnd is None:
             self.status.setText("Default black preview (no window selected).")
             return
-
-        try:
-            self.frame_captured.emit(img)
-        except Exception:
-            pass
-        try:
-            if not USE_TESS:
-                self.status.setText("OCR disabled (no Tesseract). Frames still archived.")
-                return
-            import pytesseract
-            from PIL import Image
-        except Exception:
-            self.status.setText("OCR disabled (pytesseract/PIL not available).")
+        self.frame_captured.emit(img)
+        if not (USE_TESS and pytesseract and Image):
+            self.status.setText("OCR disabled (no Tesseract/Pillow). Frames still archived.")
             return
-        try:
-            img_rgba = img.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
-            width, height = img_rgba.width(), img_rgba.height()
-            ptr = img_rgba.bits(); ptr.setsize(img_rgba.sizeInBytes())
-            pil = Image.frombuffer("RGBA", (width, height), bytes(ptr), "raw", "RGBA", 0, 1)
-            text = pytesseract.image_to_string(pil).strip()
-        except Exception as e:
-            text = ""
-            self._log(f"[error] OCR: {e}")
 
+        class OCRTask(QtCore.QRunnable):
+            def run(_):
+                try:
+                    img_rgba = img.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+                    w,h = img_rgba.width(), img_rgba.height()
+                    ptr = img_rgba.bits(); ptr.setsize(img_rgba.sizeInBytes())
+                    pil = Image.frombuffer("RGBA", (w, h), bytes(ptr), "raw", "RGBA", 0, 1)
+                    text = pytesseract.image_to_string(pil, config="--oem 3 --psm 6").strip()
+                except Exception as e:
+                    text = ""
+                    self._log(f"[error] OCR: {e}")
+                QtCore.QMetaObject.invokeMethod(self, "_apply_ocr_text", Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, text), QtCore.Q_ARG(str, reason))
+
+        self.pool.start(OCRTask())
+
+    @QtCore.pyqtSlot(str, str)
+    def _apply_ocr_text(self, text: str, reason: str):
         ts = datetime.now().strftime("%H:%M:%S")
         if text:
             line = f"[{ts}] {text}"
             self.ocr_lines.append(line)
             self.text_edit.appendPlainText(line)
             self.status.setText(f"OCR appended ({reason}).")
-            if self.debug_chk.isChecked():
-                self._log(f"[ocr] appended len={len(text)} ({reason})")
         else:
             self.status.setText(f"OCR empty ({reason}).")
-            if self.debug_chk.isChecked():
-                self._log(f"[ocr] empty ({reason})")
 
     def get_ocr_text(self) -> str:
         return "\n".join(self.ocr_lines)
@@ -858,6 +887,99 @@ class ScreenOCRWidget(QtWidgets.QWidget):
     def shutdown(self):
         try: self.timer.stop()
         except Exception: pass
+
+# ---- CoreAudio capture mute monitor (default device) ----
+CLSID_MMDeviceEnumerator = GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+IID_IMMDeviceEnumerator   = GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
+IID_IAudioEndpointVolume  = GUID('{5CDF2C82-841E-4546-9722-0CF74078229A}')
+eCapture = 1  # dataFlow
+eConsole = 0  # role
+
+class IAudioEndpointVolumeCallback(comtypes.IUnknown):
+    _iid_ = GUID('{657804FA-D6AD-4496-8A60-352752AF4F89}')
+    _methods_ = [comtypes.COMMETHOD([], HRESULT, 'OnNotify',
+                  (['in'], wintypes.LPVOID, 'pNotify'))]
+
+def _get_endpoint_volume():
+    mmde = comtypes.client.CreateObject(CLSID_MMDeviceEnumerator, interface=comtypes.gen.MMDeviceApiLib.IMMDeviceEnumerator)
+    dev = mmde.GetDefaultAudioEndpoint(eCapture, eConsole)
+    epv = dev.Activate(IID_IAudioEndpointVolume, comtypes.CLSCTX_ALL, None,
+                       interface=comtypes.gen.AudioEndpointVolumeLib.IAudioEndpointVolume)
+    return epv
+
+def read_device_mute_now() -> bool:
+    try:
+        epv = _get_endpoint_volume()
+        return bool(epv.GetMute())
+    except Exception:
+        return False
+
+def watch_device_mute(mute_event: Event, stop_event: Event):
+    """
+    Polling watcher (simple/reliable). You can implement callback registration,
+    but polling every ~300ms is plenty and avoids COM callback boilerplate.
+    """
+    last = None
+    while not stop_event.is_set():
+        try:
+            cur = read_device_mute_now()
+            if cur != last:
+                last = cur
+                if cur:
+                    mute_event.set()
+                else:
+                    mute_event.clear()
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+
+# ---- Teams UI mute watcher (UIA) ----
+def watch_teams_mute(mute_event: Event, stop_event: Event):
+    """
+    Polls the Teams main window and inspects the mute/unmute button.
+    If the UI shows 'Unmute' (meaning currently muted), we set the event.
+    """
+    try:
+        from pywinauto import Desktop
+    except Exception:
+        logging.getLogger("transcriber").warning("Teams watcher: pywinauto not available; skipping.")
+        return
+
+    desktop = Desktop(backend="uia")
+    last = None
+    while not stop_event.is_set():
+        cur = None
+        try:
+            # Try both classic ('Microsoft Teams') and new ('Microsoft Teams (work or school)') window names.
+            wins = [w for w in desktop.windows() if 'teams' in (w.window_text() or '').lower()]
+            if wins:
+                wnd = wins[0]
+                # Look for a toggle-type control. Names vary:
+                # Common patterns: 'Mute', 'Unmute', 'Microphone', tooltip variations.
+                mutes = wnd.descendants(control_type="Button")
+                label = ""
+                for btn in mutes:
+                    txt = (btn.window_text() or "").strip().lower()
+                    if any(k in txt for k in ("mute", "unmute", "microphone")):
+                        label = txt
+                        break
+                if label:
+                    # Heuristic: if button label says 'Unmute', user is muted right now (press to unmute)
+                    # If it says 'Mute', user is UNmuted (press to mute).
+                    cur = ('unmute' in label)  # True means muted
+        except Exception:
+            cur = None
+
+        if cur is not None and cur != last:
+            last = cur
+            if cur:
+                mute_event.set()
+            else:
+                mute_event.clear()
+
+        time.sleep(0.5)
+
 
 # ======================
 #     Audio Widget
@@ -870,12 +992,31 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
     def __init__(self, model, log_fn=None, get_ocr_transcript_fn=None):
         super().__init__()
         log.info("Entered AudioTranscriberWidget.__init__"); safe_flush()
-        self._ui_log = log_fn or (lambda s: None)
-        self.ui_log.connect(self._ui_log)
+        self._ui_log = log_fn or (lambda s: None)  # keep if you still want a raw callable
+        self.ui_log.connect(self._relay_log)       # <-- use the Qt slot relay instead
         self._get_ocr_transcript = get_ocr_transcript_fn or (lambda: "")
 
+        self.muted_device = Event()     # reflects device/global mute
+        self.muted_teams  = Event()     # reflects Teams UI mute (optional)
+        self._mute_watch_stop = Event()
+
+        # Start watchers
+        Thread(target=watch_device_mute, args=(self.muted_device, self._mute_watch_stop),
+               name="MuteWatchDevice", daemon=True).start()
+
+        # Optional Teams watcher
+        Thread(target=watch_teams_mute, args=(self.muted_teams, self._mute_watch_stop),
+               name="MuteWatchTeams", daemon=True).start()
+
+
         self.debug = DEBUG_MODE
-        self.force_transcription_interval = 20
+        self.mic_bytes_total = 0
+        self.spk_bytes_total = 0
+        self.last_meter_log = time.time()
+        self.force_transcription_interval = 8  # was 20; faster fallback
+        self.mix_mic_gain = 1.0
+        self.mix_spk_gain = 1.0
+
         self.last_transcription_time = time.time()
 
         self.transcription_lock = Lock()
@@ -883,7 +1024,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self.stream_lock = Lock()
         self.buffer_lock = Lock()
         self.opening_lock = Lock()
-        self.log_lock = Lock()
 
         self.transcription_in_progress = Event()
         self.stop_event = Event()
@@ -891,65 +1031,350 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         self.transcription_scheduled = Event()
 
         self.vad = webrtcvad.Vad(VAD_MODE)
-        self.buffer = deque(maxlen=CHUNKS_PER_SECOND * BUFFER_SECONDS)
+
+        # Deques: merged (legacy), plus per-source shadows
+        self.buffer = deque(maxlen=CHUNKS_PER_SECOND * BUFFER_SECONDS)         # merged (bytes @ 16k mono)
+        self.buffer_mic = deque(maxlen=CHUNKS_PER_SECOND * BUFFER_SECONDS)    # mic-only (bytes @ native SR mono)
+        self.buffer_spk = deque(maxlen=CHUNKS_PER_SECOND * BUFFER_SECONDS)    # spk-only (bytes @ native SR mono)
+
         self.audio_frames = []
         self.was_speech = False
 
-        self.model = model  # faster-whisper model handle (or None while loading)
+        self.model = model
         self.transcript_lines = []
         self.transcription_hints = deque(maxlen=10)
         self.transcription_counter = 0
 
-        # Audio interface
+        # Audio interface and two (optional) input devices
         self.pa = pyaudio.PyAudio()
-        self.stream = None
-        self.device_map = {}
-        self.device_index = None
-        self.audio_thread = None
+        self.stream_mic = None
+        self.stream_spk = None
+        self.mic_index = None
+        self.spk_index = None
 
-        # Recording state
+        self.channels = 1
+        self.sample_rate = 16000             # we write/pipe MIXED @ 16k mono
+        self.chunk_ms = CHUNK_DURATION_MS
+        self.chunk_16k = int(round(16000 * self.chunk_ms / 1000.0))  # ~30ms frames
+
+        self.audio_thread = None
         self.recording = False
         self.wav_writer = None
         self.audio_start_epoch = None
         self.recording_path = None
-
         self.samples_written = 0
         self._audio_time_last = 0.0
-        self.open_gen = 0
+
+        self.mic_open = {}
+        self.spk_open = {}
 
         self.setAcceptDrops(True)
         self.init_ui()
-
-        # devices + timers
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
-        self.device_combo.addItems(self.get_audio_device_list())
-        self.device_combo.blockSignals(False)
-        self.init_audio()
+        self.refresh_devices()
+        self.init_audio_defaults()
 
         self.force_timer = QtCore.QTimer(self)
         self.force_timer.setInterval(1000)
         self.force_timer.timeout.connect(self.check_force_transcription)
         self.force_timer.start()
 
-        log.info("Audio widget init; audio thread will start soon.")
+        log.info("Audio widget init; dual-source audio thread will start soon.")
+        
+        
+   
+        
+    # ----------------- UI -----------------
+    def init_ui(self):
+        self.status_label = QtWidgets.QLabel("Status: Silent")
+        if self.model is None:
+            self.status_label.setText("Status: Loading speech model… live audio will buffer until ready.")
+
+        # Two dropdowns
+        self.mic_combo = QtWidgets.QComboBox()
+        self.spk_combo = QtWidgets.QComboBox()
+        self.mic_combo.activated[int].connect(self.on_mic_changed)
+        self.spk_combo.activated[int].connect(self.on_spk_changed)
+
+        self.refresh_button = QtWidgets.QPushButton("🔄 Refresh Devices")
+        self.refresh_button.clicked.connect(self.refresh_devices)
+
+        self.load_file_button = QtWidgets.QPushButton("📁 Transcribe File…")
+        self.load_file_button.clicked.connect(self._switch_to_file_input)
+
+        self.transcript_box = QtWidgets.QPlainTextEdit()
+        self.transcript_box.setReadOnly(True)
+        self.transcript_box.setWordWrapMode(QtGui.QTextOption.WordWrap)
+        self.transcript_box.document().setMaximumBlockCount(15000)
+
+        self.copy_button = QtWidgets.QPushButton("Copy Transcript")
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy_transcript)
+        self.copy_button.setShortcut("Ctrl+C")
+
+        # Keep manual start/stop hidden (auto-managed)
+        self.btn_start_rec = QtWidgets.QPushButton("Start Recording"); self.btn_start_rec.hide()
+        self.btn_stop_rec  = QtWidgets.QPushButton("Stop Recording");  self.btn_stop_rec.hide()
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.status_label)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Mic →"))
+        row1.addWidget(self.mic_combo, 1)
+        row1.addSpacing(12)
+        row1.addWidget(QtWidgets.QLabel("Speaker →"))
+        row1.addWidget(self.spk_combo, 1)
+        row1.addSpacing(12)
+        row1.addWidget(self.refresh_button)
+        row1.addWidget(self.load_file_button)
+        layout.addLayout(row1)
+
+        layout.addWidget(self.transcript_box)
+        layout.addWidget(self.copy_button)
+
+        self.mic_combo.setEnabled(True)
+        self.spk_combo.setEnabled(True)
+        self.copy_button.setEnabled(False)
+
+    # inside AudioTranscriberWidget
+    @QtCore.pyqtSlot(str)
+    def _relay_log(self, line: str):
+        try:
+            parent = getattr(self, 'parent_window', None)
+            if parent is not None and hasattr(parent, "_append_log"):
+                # hop to GUI thread without needing a Qt-invokable Python method
+                QtCore.QTimer.singleShot(0, lambda l=line: parent._append_log(l))
+            else:
+                # fallback: file logger only (avoid UI loop recursion)
+                logging.getLogger("transcriber").info(line, extra={"from_ui": True})
+        except Exception:
+            logging.getLogger("transcriber").exception("UI log relay failed")
+
+    def _is_externally_muted(self) -> bool:
+        # If either source says “muted”, treat as muted.
+        return self.muted_device.is_set() or self.muted_teams.is_set()
+     
+
+    def _prefer_index(self, items, *needles):
+        """
+        Return the first item matching any needle in `label.lower()`.
+        Fallback to first list item or None.
+        """
+        if not items:
+            return None
+        lname = [d["label"].lower() for d in items]
+        for n in needles:
+            n = (n or "").lower()
+            for i, s in enumerate(lname):
+                if n in s:
+                    return i
+        return 0  # first available
+
+    def _current_combo_data(self, combo):
+        idx = combo.currentIndex()
+        return combo.itemData(idx) if idx >= 0 else None
+
+    # ----------------- Devices -----------------
+    def _enumerate_devices(self):
+        mics, spks = [], []
+        try:
+            count = self.pa.get_device_count()
+        except Exception:
+            log.exception("Failed to get device count.")
+            return mics, spks
+        for i in range(count):
+            try:
+                info = self.pa.get_device_info_by_index(i)
+                name = info.get('name', 'Unknown')
+                max_input = int(info.get('maxInputChannels', 0))
+                if max_input <= 0:
+                    continue
+                is_loopback = ('loopback' in name.lower()) or bool(info.get('isLoopbackDevice', False))
+                pretty = name
+                if "loopback" not in name.lower():
+                    pretty = f"{name} [{'Loopback' if is_loopback else 'Mic'}]"
+                d = {
+                    "index": i,
+                    "label": pretty,
+                    "default_sr": int(info.get('defaultSampleRate', 44100)),
+                    "max_in": max_input,
+                    "is_loopback": is_loopback
+                }
+
+                (spks if is_loopback else mics).append(d)
+            except Exception:
+                log.exception(f"Error accessing device {i}")
+        mics.sort(key=lambda d: d["label"].lower())
+        spks.sort(key=lambda d: d["label"].lower())
+        return mics, spks
+
+    def refresh_devices(self):
+        log.info("Refreshing audio devices..."); safe_flush()
+        try:
+            with self.opening_lock:
+                # Close streams before recreating PyAudio
+                with self.stream_lock:
+                    for s in (self.stream_mic, self.stream_spk):
+                        if s:
+                            try: s.stop_stream()
+                            except Exception: pass
+                            try: s.close()
+                            except Exception: pass
+                    self.stream_mic = None
+                    self.stream_spk = None
+
+                try: self.pa.terminate()
+                except Exception: pass
+                self.pa = pyaudio.PyAudio()
+
+            mics, spks = self._enumerate_devices()
+            self._mics = mics
+            self._spks = spks
+
+            def fill(combo, items):
+                combo.blockSignals(True)
+                cur = combo.currentText()
+                combo.clear()
+                combo.addItem("— None —", userData=None)
+                for d in items:
+                    combo.addItem(d["label"], userData=d)
+                if cur and cur in [combo.itemText(i) for i in range(combo.count())]:
+                    combo.setCurrentText(cur)
+                combo.blockSignals(False)
+
+            fill(self.mic_combo, mics)
+            fill(self.spk_combo, spks)
+            self.status_label.setText("Status: Devices refreshed.")
+            self._log_ui("Audio: device lists refreshed (Mic/Speaker).")
+        except Exception:
+            log.exception("Device refresh failed.")
+
+    # ----------------- Device change handlers -----------------
+    def on_mic_changed(self, _i):
+        # Debounce rapid changes
+        if not self.device_switch_lock.acquire(blocking=False):
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=True, reopen_spk=False))
+
+    def on_spk_changed(self, _i):
+        if not self.device_switch_lock.acquire(blocking=False):
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._safe_switch(reopen_mic=False, reopen_spk=True))
+
+
+    def init_audio_defaults(self):
+        """
+        Restore old behavior:
+          - Mic: prefer Jabra; else any mic
+          - Speaker (loopback): prefer Jabra; else "speakers"; else any loopback
+        """
+        # Mic
+        if self.mic_combo.count() > 1:
+            mic_items = [self.mic_combo.itemData(i) for i in range(1, self.mic_combo.count())]
+            mi = self._prefer_index(mic_items, "jabra")
+            self.mic_combo.setCurrentIndex(mi + 1)
+
+        # Speaker (loopback)
+        if self.spk_combo.count() > 1:
+            spk_items = [self.spk_combo.itemData(i) for i in range(1, self.spk_combo.count())]
+            si = self._prefer_index(spk_items, "jabra", "speakers", "remote")
+            self.spk_combo.setCurrentIndex(si + 1)
+
+        # Cache indexes
+        mic = self._current_combo_data(self.mic_combo)
+        spk = self._current_combo_data(self.spk_combo)
+        self.mic_index = mic.get("index") if mic else None
+        self.spk_index = spk.get("index") if spk else None
 
     def set_model(self, model):
         self.model = model
         self._log_ui("Speech model ready. Transcription will begin shortly.")
         self._try_schedule_transcription()
 
+    # ----------------- Stream open/close -----------------
+    def _try_open_single(self, dev, label):
+        """Return dict {stream, sr, ch, fpb} or None if no device."""
+        if not dev:
+            return None
+        info = self.pa.get_device_info_by_index(dev["index"])
+        max_in = int(info.get('maxInputChannels', 0))
+        if max_in <= 0:
+            return None
+        default_sr = int(info.get('defaultSampleRate', 44100))
+        sr_candidates = []
+        for sr in (default_sr, 48000, 44100, 32000, 16000, 8000):
+            if sr and sr not in sr_candidates:
+                sr_candidates.append(sr)
+        ch_candidates = [min(max_in, 2), 1] if max_in >= 2 else [1]
+        last_err = None
+        for sr in sr_candidates:
+            for ch in ch_candidates:
+                try:
+                    fpb = int(sr * self.chunk_ms / 1000.0)
+                    self._log_ui(f"Audio[{label}]: trying open @ sr={sr} ch={ch} fpb={fpb} (index={dev['index']})")
+                    s = self.pa.open(
+                        format=FORMAT, channels=ch, rate=sr,
+                        input=True, frames_per_buffer=fpb,
+                        input_device_index=dev["index"]
+                    )
+                    self._log_ui(f"Audio[{label}]: OPENED index={dev['index']} @ {sr}Hz ch={ch} fpb={fpb}")
+                    return {"stream": s, "sr": sr, "ch": ch, "fpb": fpb}
+                except Exception as e:
+                    self._log_ui(f"Audio[{label}]: open failed @ sr={sr} ch={ch} fpb={fpb} → {type(e).__name__}: {e}")
+                    last_err = e
+        self._log_ui(f"Audio[{label}]: failed to open (last error: {last_err})")
+        return None
+
+    def start_audio_thread(self):
+        if getattr(self, "transcribing_file", False):
+            return
+        if self.audio_thread is not None and self.audio_thread.is_alive():
+            return
+
+        def open_and_run():
+            try:
+                with self.opening_lock:
+                    mic_dev = self.mic_combo.currentData()
+                    spk_dev = self.spk_combo.currentData()
+                    mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
+                    spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
+                    with self.stream_lock:
+                        self.stream_mic = mic_state["stream"] if mic_state else None
+                        self.stream_spk = spk_state["stream"] if spk_state else None
+                        self.mic_open = mic_state or {}
+                        self.spk_open = spk_state or {}
+                        self._log_ui(f"Audio: mic_open={bool(self.stream_mic)} {self.mic_open!r}")
+                        self._log_ui(f"Audio: spk_open={bool(self.stream_spk)} {self.spk_open!r}")
+
+
+                if not self.stream_mic and not self.stream_spk:
+                    self.status_label.setText("Status: No input streams. Pick Mic and/or Speaker.")
+                    self.copy_button.setEnabled(bool(self.transcript_lines))
+                    return
+
+                # Begin recording to a 16 kHz mono WAV (merged)
+                self.begin_recording_if_ready()
+
+                self.stop_event.clear()
+                self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
+                self.audio_thread.start()
+                self._log_ui("Audio: streams opened and audio thread started (dual-capable).")
+                self.copy_button.setEnabled(True)
+            except Exception:
+                log.exception("start_audio_thread: error")
+
+        Thread(target=open_and_run, name="AudioOpen", daemon=True).start()
+
+
     def begin_recording_if_ready(self):
         if self.recording:
-            return
-        if not hasattr(self, "channels") or not hasattr(self, "sample_rate"):
             return
         _ensure_dir(TEMP_DIR); _ensure_dir(TEMP_FRAMES)
         try:
             ww = wave.open(str(TEMP_WAV), "wb")
-            ww.setnchannels(self.channels)
+            ww.setnchannels(1)
             ww.setsampwidth(SAMPLE_WIDTH)
-            ww.setframerate(self.sample_rate)
+            ww.setframerate(16000)         # merged file @ 16 kHz mono
             self.wav_writer = ww
             self.recording = True
             self.audio_start_epoch = time.time()
@@ -963,126 +1388,352 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             self.recording = False
             logging.getLogger("transcriber").exception(f"Auto record start failed: {e}")
 
-    def init_ui(self):
-        self.status_label = QtWidgets.QLabel("Status: Silent")
-        if self.model is None:
-            self.status_label.setText("Status: Loading speech model… live audio will buffer until ready.")
-      
-        self.device_combo = QtWidgets.QComboBox()
-        self.device_combo.activated[int].connect(self.change_audio_device)
-        self.refresh_button = QtWidgets.QPushButton("🔄 Refresh Devices")
-        self.refresh_button.clicked.connect(self.refresh_devices)
-
-        self.transcript_box = QtWidgets.QPlainTextEdit()
-        self.transcript_box.setReadOnly(True)
-        self.transcript_box.setWordWrapMode(QtGui.QTextOption.WordWrap)
-        self.transcript_box.document().setMaximumBlockCount(15000)
-
-        self.copy_button = QtWidgets.QPushButton("Copy Transcript")
-        self.copy_button.setEnabled(False)
-        self.copy_button.clicked.connect(self.copy_transcript)
-        self.copy_button.setShortcut("Ctrl+C")
-
-        self.clear_button = QtWidgets.QPushButton("Clear Transcript")
-        self.clear_button.clicked.connect(self.clear_transcript)
-
-        self.btn_start_rec = QtWidgets.QPushButton("Start Recording")
-        self.btn_stop_rec = QtWidgets.QPushButton("Stop Recording")
-        self.btn_stop_rec.setEnabled(False)
-        self.btn_start_rec.clicked.connect(self._start_recording_clicked)
-        self.btn_stop_rec.clicked.connect(self._stop_recording_clicked)
-
-        # hide manual audio controls
-        self.btn_start_rec.hide()
-        self.btn_stop_rec.hide()
-        self.clear_button.hide()
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.device_combo)
-        layout.addWidget(self.refresh_button)
-        layout.addWidget(self.transcript_box)
-        layout.addWidget(self.copy_button)
-        layout.addWidget(self.clear_button)
-        rec_row = QtWidgets.QHBoxLayout()
-        rec_row.addWidget(self.btn_start_rec)
-        rec_row.addWidget(self.btn_stop_rec)
-        rec_row.addStretch(1)
-        layout.addLayout(rec_row)
-
-        self.device_combo.setEnabled(False)
-        self.copy_button.setEnabled(False)
-
-    def _start_recording_clicked(self):
-        if self.recording:
-            return
-        if not hasattr(self, "channels") or not hasattr(self, "sample_rate"):
-            QMessageBox.warning(self, "Audio", "Audio stream not initialized yet.")
-            return
-        _ensure_dir(TEMP_DIR)
-        _ensure_dir(TEMP_FRAMES)
+    def _safe_switch(self, reopen_mic=False, reopen_spk=False):
         try:
-            ww = wave.open(str(TEMP_WAV), "wb")
-            ww.setnchannels(self.channels)
-            ww.setsampwidth(SAMPLE_WIDTH)
-            ww.setframerate(self.sample_rate)
-            self.wav_writer = ww
-            self.recording = True
-            self.audio_start_epoch = time.time()
-            self.recording_path = str(TEMP_WAV)
-            self.samples_written = 0
-            self._audio_time_last = 0.0
-            self.btn_start_rec.setEnabled(False)
-            self.btn_stop_rec.setEnabled(True)
-            self.ui_log.emit(f"Audio: recording started → {TEMP_WAV.name}")
-            self.recording_started.emit(self.audio_start_epoch)
-        except Exception as e:
-            self.wav_writer = None
-            self.recording = False
-            QMessageBox.critical(self, "Audio", f"Failed to start recording: {e}")
+            self.suspend_transcription.set()
+            self.status_label.setText("Status: Switching device(s)…")
+            QtCore.QCoreApplication.processEvents()
 
-    def flush_pending_transcription(self):
-        if self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
+            # Pause loop cleanly
+            self.stop_event.set()
+            t = self.audio_thread
+            if t and t.is_alive():
+                deadline = time.time() + 1.0
+                while t.is_alive() and time.time() < deadline:
+                    QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+                    time.sleep(0.01)
+            # (don’t worry if it’s still alive; we’ll replace it shortly)
+
+            # Close selected streams only
+            with self.opening_lock:
+                with self.stream_lock:
+                    if reopen_mic and self.stream_mic:
+                        try: self.stream_mic.stop_stream()
+                        except Exception: pass
+                        try: self.stream_mic.close()
+                        except Exception: pass
+                        self.stream_mic = None
+                    if reopen_spk and self.stream_spk:
+                        try: self.stream_spk.stop_stream()
+                        except Exception: pass
+                        try: self.stream_spk.close()
+                        except Exception: pass
+                        self.stream_spk = None
+
+            # Reopen requested sides
+            with self.opening_lock:
+                if reopen_mic:
+                    mic_dev = self._current_combo_data(self.mic_combo)
+                    mic_state = self._try_open_single(mic_dev, "MIC") if mic_dev else None
+                    with self.stream_lock:
+                        self.stream_mic = mic_state["stream"] if mic_state else None
+                        self.mic_open = mic_state or {}
+                if reopen_spk:
+                    spk_dev = self._current_combo_data(self.spk_combo)
+                    spk_state = self._try_open_single(spk_dev, "SPK") if spk_dev else None
+                    with self.stream_lock:
+                        self.stream_spk = spk_state["stream"] if spk_state else None
+                        self.spk_open = spk_state or {}
+
+            # If neither reopened successfully, keep running with whatever we have (or idle).
+            self.stop_event.clear()
+            self.audio_thread = Thread(target=self.audio_loop, name="AudioLoopDual", daemon=True)
+            self.audio_thread.start()
+            self.status_label.setText("Status: Device(s) switched.")
+            with self.stream_lock:
+                sm = bool(self.stream_mic and self.stream_mic.is_active())
+                ss = bool(self.stream_spk and self.stream_spk.is_active())
+            self._log_ui(f"Switch: streams active → MIC={sm} SPK={ss}")
+
+        except Exception:
+            log.exception("Device switch failed")
+            self.status_label.setText("Status: Device switch failed (see log).")
+        finally:
+            self.suspend_transcription.clear()
+            try: self.device_switch_lock.release()
+            except Exception: pass
+
+    # ----------------- Audio loop (dual source) -----------------
+    def audio_loop(self):
+        self._log_ui("Audio: loop entered (dual-source)")
+        VAD_SR = 16000
+        VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
+
+        def safe_read(stream, want_frames):
+            try:
+                avail = stream.get_read_available()
+                if avail is None:
+                    # some hosts return None; fall back to small non-blocking chunk
+                    avail = 0
+                # read if we have at least half of what we want; cap to available
+                n = min(avail, want_frames) if avail >= (want_frames // 2) else 0
+                if n > 0:
+                    return stream.read(n, exception_on_overflow=False)
+                return None
+            except Exception:
+                return None
+
+        def to_mono_i16(raw, ch):
+            if not raw:
+                return None
+            try:
+                x = np.frombuffer(raw, dtype=np.int16)
+                ch = max(1, int(ch or 1))
+                if ch > 1:
+                    x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
+                return x
+            except Exception:
+                return None
+
+        def i16_to_f32(x):
+            return (x.astype(np.float32) / 32768.0) if x is not None and x.size else None
+
+        def rms_db(x):
+            if x is None or not x.size:
+                return -120.0
+            r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)) + 1e-12)
+            return 20.0 * math.log10(r + 1e-20)
+
+        # local snapshots of streams/params
+        with self.stream_lock:
+            s_m = getattr(self, "stream_mic", None)
+            s_s = getattr(self, "stream_spk", None)
+        m_state = dict(getattr(self, "mic_open", {}) or {})
+        s_state = dict(getattr(self, "spk_open", {}) or {})
+
+        self._log_ui(f"Audio cfg: MIC sr={m_state.get('sr')} ch={m_state.get('ch')} fpb={m_state.get('fpb')}; "
+                     f"SPK sr={s_state.get('sr')} ch={s_state.get('ch')} fpb={s_state.get('fpb')}")
+
+        m_fpb = int(m_state.get("fpb", 0) or 0)
+        s_fpb = int(s_state.get("fpb", 0) or 0)
+
+        # -------------------------------------
+        with self.stream_lock:
+            if self.stream_mic and not self.stream_mic.is_active():
+                try:
+                    self.stream_mic.start_stream()
+                    self._log_ui("Audio[MIC]: stream started manually")
+                except Exception:
+                    self._log_ui("Audio[MIC]: failed to start stream")
+
+            if self.stream_spk and not self.stream_spk.is_active():
+                try:
+                    self.stream_spk.start_stream()
+                except Exception:
+                    self._log_ui("Audio[SPK]: failed to start stream")
+            # -------------------------------------
+            sm_active = bool(self.stream_mic and self.stream_mic.is_active())
+            ss_active = bool(self.stream_spk and self.stream_spk.is_active())
+            self._log_ui(f"Audio: post-start active → MIC={sm_active} SPK={ss_active}")
+            
+            mic_block = safe_read(s_m, m_fpb) if (s_m and m_fpb > 0) else None
+            spk_block = safe_read(s_s, s_fpb) if (s_s and s_fpb > 0) else None
+       
+            try:
+                m_av = s_m.get_read_available() if s_m else None
+                s_av = s_s.get_read_available() if s_s else None
+                self._log_ui(f"Audio: initial read_available → MIC={m_av} SPK={s_av}")
+            except Exception as e:
+                self._log_ui(f"Audio: initial read_available error: {e}")
+
+        while not self.stop_event.is_set():
+            # Pull a block from each *if available*
+            mic_block = None
+            spk_block = None
+
+            with self.stream_lock:
+                s_m = getattr(self, "stream_mic", None)
+                s_s = getattr(self, "stream_spk", None)
+
+            try:
+                if s_m and s_m.is_active() and m_fpb > 0:
+                    mic_block = safe_read(s_m, m_fpb)
+                    self.mic_bytes_total += len(mic_block or b"")
+            except Exception as e:
+                self._log_ui(f"Audio[MIC]: read error → {type(e).__name__}: {e}")
+                mic_block = None
+
+
+            try:
+                if s_s and s_s.is_active() and s_fpb > 0:
+                    spk_block = safe_read(s_s, s_fpb)
+                    self.spk_bytes_total += len(spk_block or b"")
+            except Exception as e:
+                self._log_ui(f"Audio[SPK]: read error → {type(e).__name__}: {e}")
+                spk_block = None
+
+
+            # Convert to mono i16
+            mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
+            spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
+
+            # Resample to 16k float32 for VAD + mix
+            m_sr = int(m_state.get("sr", 16000) or 16000)
+            s_sr = int(s_state.get("sr", 16000) or 16000)
+            mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
+            spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
+
+            # Feed per-source 16k i16 bytes into dedicated buffers (for proper tagging)
+            if mic_i16 is not None and mic_i16.size:
+                try:
+                    mic_bytes_16k = _resample_i16_for_vad(mic_i16, m_sr, 16000)
+                    with self.buffer_lock:
+                        self.buffer_mic.append(mic_bytes_16k)
+                except Exception:
+                    pass
+
+            if spk_i16 is not None and spk_i16.size:
+                try:
+                    spk_bytes_16k = _resample_i16_for_vad(spk_i16, s_sr, 16000)
+                    with self.buffer_lock:
+                        self.buffer_spk.append(spk_bytes_16k)
+                except Exception:
+                    pass
+
+            # Log meters occasionally so we can see if mic is alive
+            now = time.time()
+            if self.debug and now - self.last_meter_log > 5.0:
+                db_m = rms_db(mic_f) if mic_f is not None else -120.0
+                db_s = rms_db(spk_f) if spk_f is not None else -120.0
+                self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
+                             f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
+                self.last_meter_log = now
+
+
+            # Per-source VAD (use last 30ms of each if present)
+            def vad_last30(xf):
+                if xf is None: return False
+                if xf.size < VAD_SAMPLES_30MS: return False
+                y = xf[-VAD_SAMPLES_30MS:]
+                y16 = np.clip(np.round(y*32768), -32768, 32767).astype(np.int16)
+                try: return self.vad.is_speech(y16.tobytes(), 16000)
+                except: return False
+
+            now = time.time()
+            if not hasattr(self, "_last_buf_log"):
+                self._last_buf_log = 0.0
+            if now - self._last_buf_log > 5.0:
+                with self.buffer_lock:
+                    mb = sum(len(b) for b in self.buffer_mic)
+                    sb = sum(len(b) for b in self.buffer_spk)
+                    mm = sum(len(b) for b in self.buffer)
+                # 2 bytes/sample @ 16k
+                def b2ms(n): return (n / (2*16000.0)) * 1000.0
+                self._log_ui(f"Buf: MIC={mb}B ({b2ms(mb):.0f}ms) SPK={sb}B ({b2ms(sb):.0f}ms) MIX={mm}B ({b2ms(mm):.0f}ms)")
+                self._last_buf_log = now
+
+            mic_speech = vad_last30(mic_f)
+            spk_speech = vad_last30(spk_f)
+
+            if mic_speech or spk_speech:
+                self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
+
+            muted = self._is_externally_muted()
+            QtCore.QMetaObject.invokeMethod(
+                self.status_label, "setText", Qt.QueuedConnection,
+                QtCore.Q_ARG(str, "Status: Muted (following Teams/device)" if muted else "Status: Listening…")
+            )
+
+            # Build the mixed float32 16k chunk (align lengths)
+            mix = None
+            if mic_f is not None and spk_f is not None:
+                n = min(mic_f.size, spk_f.size)
+                if n > 0:
+                    mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
+                    # prevent clipping
+                    mix = np.clip(mix, -1.0, 1.0)
+            elif mic_f is not None:
+                mix = self.mix_mic_gain * mic_f
+            elif spk_f is not None:
+                mix = self.mix_spk_gain * spk_f
+
+            # Append mixed audio to the transcription buffer in raw int16 (16k)
+            i16 = b""  # <— initialize so it's always defined
+            if mix is not None and mix.size:
+                i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
+                with self.buffer_lock:
+                    self.buffer.append(i16)
+                    
+            # --- write to the merged WAV on disk (16k mono) ---
+            try:
+                if self.wav_writer:
+                    self.wav_writer.writeframes(i16)
+                    self.samples_written += len(i16) // 2  # int16 samples
+                    # log every ~5s of written audio
+                    if (time.time() - getattr(self, "_last_wav_log", 0)) > 5.0:
+                        self._log_ui(f"WAV: samples_written={self.samples_written} (~{self.samples_written/16000.0:.1f}s)")
+                        self._last_wav_log = time.time()
+            except Exception as e:
+                self._log_ui(f"WAV write error → {type(e).__name__}: {e}")
+
+            # UI + scheduling
+            # --- inside AudioTranscriberWidget.audio_loop() ---
+
+            # (A) VAD activity branch
+            if mic_speech or spk_speech:
+                self.was_speech = True
+                if ((not self._is_externally_muted()) or spk_speech):
+                    QtCore.QTimer.singleShot(0, self._try_schedule_transcription)   # was: self._try_schedule_transcription()
+                    self._log_ui("Transcribe scheduled: VAD activity")
+                else:
+                    self._log_ui("Muted externally → skip scheduling on VAD")
+                if mic_speech and self._is_externally_muted():
+                    self.transcription_hints.append("[MIC - Muted]")
+                if mic_speech and not self._is_externally_muted():
+                    self.transcription_hints.append("[MIC]")
+                if spk_speech:
+                    self.transcription_hints.append("[SPK]")
+
+            # (B) Silent branch, time-based fallback
+            else:
+                if self.was_speech:
+                    self.was_speech = False
+                    QtCore.QMetaObject.invokeMethod(
+                        self.status_label, "setText", Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, "Status: Silent")
+                    )
+                if (now - self.last_transcription_time) > self.force_transcription_interval:
+                    with self.buffer_lock:
+                        have_any = len(self.buffer) > 0
+                    if have_any and not self._is_externally_muted():
+                        QtCore.QTimer.singleShot(0, self._try_schedule_transcription)
+                        self._log_ui("Transcribe scheduled: Force due to duration of audio")
+
+            time.sleep(0.002)
+
+    # ----------------- Transcription -----------------
+    def _try_schedule_transcription(self):
+        if self.suspend_transcription.is_set():
+            self._log_ui("Transcribe not scheduled: suspended")
+            return
+        if self.transcription_in_progress.is_set():
+            self._log_ui("Transcribe not scheduled: already in progress")
+            return
+        if self.transcription_scheduled.is_set():
+            self._log_ui("Transcribe not scheduled: already scheduled")
             return
         with self.buffer_lock:
-            has_data = len(self.buffer) > 0
-        if has_data:
-            self.transcribe_buffer()
-
-    def _stop_recording_clicked(self):
-        if not self.recording:
+            total_now = sum(len(b) for b in self.buffer) \
+                      + sum(len(b) for b in self.buffer_mic) \
+                      + sum(len(b) for b in self.buffer_spk)
+        if total_now < 9600:
+            self._log_ui(f"Transcribe not scheduled: total_buf={total_now}B (<9600B)")
             return
-        try:
-            if self.wav_writer:
-                self.wav_writer.close()
-        except Exception:
-            pass
-        self.wav_writer = None
-        self.recording = False
-        self.btn_start_rec.setEnabled(True)
-        self.btn_stop_rec.setEnabled(False)
-        self.ui_log.emit(f"Audio: recording stopped ({self.recording_path})")
-        if self.recording_path and self.audio_start_epoch is not None:
-            self.recording_stopped.emit(self.recording_path, self.audio_start_epoch)
+        self._log_ui(f"Transcribe scheduled: total_buf={total_now}B")
+        self.transcription_scheduled.set()
+        Thread(target=lambda: (self.transcribe_buffer(), self.transcription_scheduled.clear()),
+               name="TranscribeBuffer", daemon=True).start()
 
-    def stop_recording_if_active(self):
-        if self.recording:
-            self._stop_recording_clicked()
-            QtWidgets.QApplication.processEvents()
-            time.sleep(0.05)
-
-    def get_audio_time(self) -> float | None:
-        if self.recording and hasattr(self, "sample_rate") and self.sample_rate > 0:
-            t = float(self.samples_written) / float(self.sample_rate)
-            if t < self._audio_time_last:
-                t = self._audio_time_last
-            self._audio_time_last = t
-            return t
-        return None
-
-    def _log_ui(self, msg: str):
-        try: self._ui_log(msg)
-        except Exception: pass
+    def check_force_transcription(self):
+        if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
+            return
+        with self.buffer_lock:
+            have_any = (len(self.buffer) > 0 or len(self.buffer_mic) > 0 or len(self.buffer_spk) > 0)
+        if not have_any:
+            return
+        if (time.time() - self.last_transcription_time) > self.force_transcription_interval:
+            self._log_ui("Transcribe scheduled: force timer")
+            self._try_schedule_transcription()
 
     @contextmanager
     def transcription_guard(self):
@@ -1092,398 +1743,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         finally:
             self.transcription_in_progress.clear()
 
-    def _try_schedule_transcription(self):
-        if self.suspend_transcription.is_set():
-            return
-        if self.transcription_in_progress.is_set() or self.transcription_scheduled.is_set():
-            return
-        self.transcription_scheduled.set()
-        def run():
-            try:
-                self.transcribe_buffer()
-            finally:
-                self.transcription_scheduled.clear()
-        Thread(target=run, name="TranscribeBuffer", daemon=True).start()
-
-    def clear_transcript(self):
-        self.transcript_lines.clear()
-        self.transcript_box.clear()
-        self.copy_button.setEnabled(False)
-        self.status_label.setText("Status: Transcript cleared.")
-        self._log_ui("Audio: transcript cleared.")
-
-    def _write_audio_line(self, line: str):
-        self.transcript_lines.append(line)
-        QtCore.QMetaObject.invokeMethod(
-            self.transcript_box,
-            "appendPlainText",
-            Qt.QueuedConnection,
-            QtCore.Q_ARG(str, line)
-        )
-
-    # Devices (unchanged)
-    def get_audio_device_list(self):
-        device_list = []
-        loopback_devices, mic_devices = [], []
-        self.device_map = {}
-        combo_index = 0
-        try:
-            count = self.pa.get_device_count()
-        except Exception:
-            log.exception("Failed to get device count.")
-            count = 0
-        for i in range(count):
-            try:
-                info = self.pa.get_device_info_by_index(i)
-                name = info.get('name', 'Unknown')
-                max_input = int(info.get('maxInputChannels', 0))
-                is_loopback = 'loopback' in name.lower() or bool(info.get('isLoopbackDevice', False))
-                if max_input <= 0:
-                    continue
-                label = f"{name} [{'Loopback' if is_loopback else 'Mic'}]"
-                tup = (label.lower(), label, i)
-                (loopback_devices if is_loopback else mic_devices).append(tup)
-            except Exception:
-                log.exception(f"Error accessing device {i}")
-        loopback_devices.sort(); mic_devices.sort()
-        for _, label, device_index in (loopback_devices + mic_devices):
-            device_list.append(label)
-            self.device_map[combo_index] = device_index
-            combo_index += 1
-        if not device_list:
-            log.error("No Input-Capable Audio Devices Found")
-        device_list.append("📁 Load Audio/Video File...")
-        self.device_map[len(device_list) - 1] = "FILE_INPUT"
-        return device_list
-
-    def select_default_device(self):
-        try:
-            jabra_device = None
-            speakers_device = None
-            remote_device = None
-            count = self.pa.get_device_count()
-            for i in range(count):
-                info = self.pa.get_device_info_by_index(i)
-                name = info['name'].lower()
-                if "loopback" in name:
-                    if "jabra" in name and jabra_device is None:
-                        jabra_device = i
-                    elif "speakers" in name and speakers_device is None:
-                        speakers_device = i
-                    elif "remote" in name and remote_device is None:
-                        remote_device = i
-            if jabra_device is not None:
-                return jabra_device
-            if speakers_device is not None:
-                return speakers_device
-            if remote_device is not None:
-                return remote_device
-            info = self.pa.get_default_input_device_info()
-            return info['index']
-        except Exception:
-            log.exception("Default Device Selection Error")
-            return None
-
-    def init_audio(self):
-        self.device_index = self.select_default_device()
-        if self.device_index is None:
-            self.status_label.setText("Status: No input device found.")
-            self._log_ui("Audio: no input device found.")
-            return
-        default_combo_index = next((k for k, v in self.device_map.items() if v == self.device_index), 0)
-        QtCore.QTimer.singleShot(0, lambda: self.device_combo.setCurrentIndex(default_combo_index))
-
-    def refresh_devices(self):
-        log.info("Refreshing audio devices..."); safe_flush()
-        try:
-            with self.opening_lock:
-                try: self.pa.terminate()
-                except Exception: pass
-                self.pa = pyaudio.PyAudio()
-                self.device_combo.blockSignals(True)
-                current_text = self.device_combo.currentText()
-                device_names = self.get_audio_device_list()
-                self.device_combo.clear(); self.device_combo.addItems(device_names)
-                if not device_names:
-                    self.status_label.setText("Status: No input devices found.")
-                    self.device_combo.blockSignals(False)
-                    return
-                if current_text in device_names:
-                    self.device_combo.setCurrentText(current_text)
-                else:
-                    self.device_combo.setCurrentIndex(0)
-                self.device_combo.blockSignals(False)
-                self.device_combo.setEnabled(True)
-                self.status_label.setText("Status: Device list refreshed.")
-                self._log_ui("Audio: device list refreshed.")
-        except Exception:
-            log.exception("Device refresh failed.")
-
-    @QtCore.pyqtSlot()
-    def start_audio_thread(self):
-        if getattr(self, "transcribing_file", False):
-            return
-        if self.audio_thread is not None and self.audio_thread.is_alive():
-            return
-
-        def stream_and_start():
-            try:
-                # NEW: Skip if no input device
-                if self.device_index is None:
-                    self.status_label.setText("Status: No input device. Choose '📁 Load Audio/Video File…' or attach a device.")
-                    self.device_combo.setEnabled(True)
-                    self.copy_button.setEnabled(bool(self.transcript_lines))
-                    self._log_ui("Audio: no input device; idle. Use file input or attach a mic/loopback device.")
-                    return
-
-                time.sleep(0.2)
-                ok = self.open_stream()
-                if not ok:
-                    self.status_label.setText("Status: Stream failed.")
-                    self.device_combo.setEnabled(True)
-                    return
-                self.begin_recording_if_ready()
-                self.stop_event.clear()
-                self.audio_thread = Thread(target=self.audio_loop, name="AudioLoop", daemon=True)
-                self.audio_thread.start()
-                self._log_ui("Audio: stream opened and audio thread started.")
-                self.device_combo.setEnabled(True)
-                self.copy_button.setEnabled(True)
-            except Exception:
-                log.exception("start_audio_thread: error")
-        QtCore.QTimer.singleShot(0, stream_and_start)
-
-    def open_stream(self):
-        try:
-            with self.opening_lock:
-                self.open_gen += 1
-                my_gen = self.open_gen
-                open_done = Event()
-
-                def try_open():
-                    local_stream = None
-                    try:
-                        info = self.pa.get_device_info_by_index(self.device_index)
-
-                        max_in = int(info.get('maxInputChannels', 0))
-                        if max_in <= 0:
-                            raise ValueError(f"Device '{info.get('name','?')}' has no input channels.")
-
-                        # Candidate sample rates: device default first, then common ones
-                        default_sr = int(info.get('defaultSampleRate', 44100))
-                        candidates = []
-                        for sr in (default_sr, 48000, 44100, 32000, 16000, 8000):
-                            if sr and sr not in candidates:
-                                candidates.append(sr)
-
-                        # Try 2 → 1 channels
-                        chan_candidates = [min(max_in, 2), 1] if max_in >= 2 else [1]
-
-                        picked_sr = None
-                        picked_ch = None
-                        chunk_ms = 20  # 20ms frames are ideal for VAD
-
-                        last_err = None
-                        for sr in candidates:
-                            for ch in chan_candidates:
-                                try:
-                                    frames_per_buffer = int(sr * chunk_ms / 1000)
-                                    local_stream = self.pa.open(
-                                        format=FORMAT,
-                                        channels=ch,
-                                        rate=sr,
-                                        input=True,
-                                        frames_per_buffer=frames_per_buffer,
-                                        input_device_index=self.device_index,
-                                    )
-                                    picked_sr = sr
-                                    picked_ch = ch
-                                    break  # success
-                                except Exception as e:
-                                    last_err = e
-                                    local_stream = None
-                            if local_stream:
-                                break
-
-                        if not local_stream:
-                            raise OSError(f"Could not open device {self.device_index} with any of: "
-                                          f"rates={candidates}, channels={chan_candidates} (last error: {last_err})")
-
-                        # Commit chosen params
-                        self.sample_rate = int(picked_sr)
-                        self.channels = int(picked_ch)
-                        # 30 ms chunks (rounded) so WASAPI 44.1k becomes 1323 (not truncated)
-                        self.chunk_size = int(round(self.sample_rate * CHUNK_DURATION_MS / 1000.0))
-                        self.chunk_size = max(1, self.chunk_size)
-
-                    except Exception:
-                        log.exception(f"Error opening stream on index {self.device_index}")
-                        local_stream = None
-                    finally:
-                        try:
-                            if my_gen == self.open_gen and local_stream:
-                                with self.stream_lock:
-                                    self.stream = local_stream
-                            else:
-                                if local_stream:
-                                    try:
-                                        local_stream.stop_stream(); local_stream.close()
-                                    except Exception:
-                                        pass
-                        finally:
-                            open_done.set()
-
-                t = Thread(target=try_open, name="OpenStream", daemon=True)
-                t.start()
-                open_done.wait(timeout=8)
-
-                with self.stream_lock:
-                    if not self.stream or not self.stream.is_active():
-                        self.stream = None
-                        return False
-
-                self._log_ui(f"Audio: opened device index {self.device_index} @ {self.sample_rate} Hz, "
-                             f"channels={self.channels}, chunk={self.chunk_size} frames (~20 ms)")
-                return True
-        except Exception:
-            log.exception("Stream Open Error")
-            return False
-
-    def audio_loop(self):
-        self._log_ui("Audio: loop entered"); safe_flush()
-        with self.stream_lock:
-            local_stream = self.stream
-        if not local_stream or not local_stream.is_active():
-            self._log_ui("Audio: no valid stream on entry; exiting loop.")
-            return
-
-        consecutive_empty_reads = 0
-        MAX_EMPTY_READS = 10
-
-        # VAD expects 10/20/30 ms at 8/16/32/48 kHz. We'll feed it 30 ms @ 16 kHz.
-        VAD_SR = 16000
-        VAD_SAMPLES_30MS = int(VAD_SR * 0.03)  # 480 samples
-
-        try:
-            while not self.stop_event.is_set():
-                with self.stream_lock:
-                    local_stream = self.stream
-                if not local_stream or not local_stream.is_active():
-                    break
-
-                try:
-                    data = local_stream.read(self.chunk_size, exception_on_overflow=False)
-                    if not data:
-                        consecutive_empty_reads += 1
-                        if consecutive_empty_reads >= MAX_EMPTY_READS:
-                            break
-                        continue
-                    else:
-                        consecutive_empty_reads = 0
-                except Exception:
-                    break
-
-                if self.stop_event.is_set():
-                    break
-
-                # ---- write WAV if recording ----
-                if self.recording and self.wav_writer:
-                    try:
-                        ww = self.wav_writer
-                        if ww is None or getattr(ww, "_file", None) is None:
-                            raise RuntimeError("WAV writer closed")
-                        ww.writeframes(data)
-                        samples_per_channel = len(data) // (SAMPLE_WIDTH * self.channels)
-                        if samples_per_channel > 0:
-                            self.samples_written += samples_per_channel
-                    except Exception as e:
-                        log.exception(f"Recording write error: {e}")
-                        self.ui_log.emit("Audio: recording write error; stopping recording.")
-                        try:
-                            if self.wav_writer:
-                                self.wav_writer.close()
-                        except Exception:
-                            pass
-                        self.wav_writer = None
-                        self.recording = False
-                        self.btn_start_rec.setEnabled(True)
-                        self.btn_stop_rec.setEnabled(False)
-
-                # ---- prepare mono int16 for VAD ----
-                try:
-                    int_data = np.frombuffer(data, dtype=np.int16)
-                    ch = max(1, getattr(self, "channels", 1))
-                    if int_data.size == 0 or (int_data.size % ch) != 0:
-                        # bad frame size; skip quietly
-                        continue
-                    if ch > 1:
-                        # average to mono, keep int16 range
-                        mono = int_data.reshape(-1, ch).mean(axis=1).astype(np.int16)
-                    else:
-                        mono = int_data
-                except Exception:
-                    continue
-
-                # ---- VAD on 30 ms @ 16k (resample if needed) ----
-                try:
-                    # create a 30 ms window for VAD (use the last 30 ms worth after resample)
-                    vad_buf = _resample_i16_for_vad(mono, getattr(self, "sample_rate", 16000), VAD_SR)
-                    if not vad_buf:
-                        continue
-                    # bytes -> int16 view to slice last 30 ms exactly
-                    vad_i16 = np.frombuffer(vad_buf, dtype=np.int16)
-                    if vad_i16.size < VAD_SAMPLES_30MS:
-                        # too small; accumulate via buffer (still push to transcription buffer below)
-                        is_speech = False
-                    else:
-                        # take last 30 ms
-                        vad_window = vad_i16[-VAD_SAMPLES_30MS:]
-                        is_speech = self.vad.is_speech(vad_window.tobytes(), VAD_SR)
-                except Exception:
-                    # if VAD fails, fall back to "not speech" but still allow buffering
-                    is_speech = False
-
-                # ---- Buffer raw device data for later transcription regardless; VAD gates pacing/UI only ----
-                with self.buffer_lock:
-                    self.buffer.append(data)
-
-                if is_speech:
-                    QtCore.QMetaObject.invokeMethod(
-                        self.status_label, "setText",
-                        Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Listening...")
-                    )
-                    self.was_speech = True
-                    now = time.time()
-                    if len(self.buffer) >= self.buffer.maxlen - 1 or (now - self.last_transcription_time) > self.force_transcription_interval:
-                        self._try_schedule_transcription()
-                else:
-                    # transition to silence ⇒ flush what we have if it's sizable
-                    if self.was_speech:
-                        self.was_speech = False
-                        QtCore.QMetaObject.invokeMethod(
-                            self.status_label, "setText",
-                            Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Silent")
-                        )
-                        with self.buffer_lock:
-                            enough = len(self.buffer) >= POOL_CHUNKS
-                        if enough:
-                            self._try_schedule_transcription()
-
-                time.sleep(0.003)
-        finally:
-            self._log_ui("Audio: loop exiting"); safe_flush()
-
-    def check_force_transcription(self):
-        if self.stop_event.is_set() or self.suspend_transcription.is_set() or self.transcription_in_progress.is_set():
-            return
-        with self.buffer_lock:
-            buf_has_data = len(self.buffer) > 0
-        if not buf_has_data:
-            return
-        now = time.time()
-        if (now - self.last_transcription_time) > self.force_transcription_interval:
-            self._try_schedule_transcription()
-
     def transcribe_buffer(self):
         with self.transcription_guard():
             if self.model is None:
@@ -1492,191 +1751,124 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 return
 
             self.last_transcription_time = time.time()
-            with self.buffer_lock:
-                audio_data = b"".join(self.buffer)
-                self.buffer.clear()
 
-            if not audio_data:
-                self._log_ui("Transcribe skip: buffer empty.")
+            # Require at least ~0.3s of audio in any stream before processing
+            # 16 kHz * 0.3 s * 2 bytes ≈ 9600 bytes
+            MIN_BYTES = 9600
+
+            with self.buffer_lock:
+                merged_len = sum(len(b) for b in self.buffer)
+                mic_len    = sum(len(b) for b in self.buffer_mic)
+                spk_len    = sum(len(b) for b in self.buffer_spk)
+
+            if not (merged_len >= MIN_BYTES or mic_len >= MIN_BYTES or spk_len >= MIN_BYTES):
                 return
 
+            # then snapshot actual bytes once you’ve decided to proceed
+            with self.buffer_lock:
+                merged_bytes = b"".join(self.buffer); self.buffer.clear()
+                mic_bytes    = b"".join(self.buffer_mic); self.buffer_mic.clear()
+                spk_bytes    = b"".join(self.buffer_spk); self.buffer_spk.clear()
+
+            # --- convert to float32 16k for the model as you already do ---
+            merged_f32_16k = i16_bytes_to_f32_16k(merged_bytes, 16000) if merged_bytes else np.zeros(0, np.float32)
+            mic_f32_16k    = i16_bytes_to_f32_16k(mic_bytes,    16000) if mic_bytes    else np.zeros(0, np.float32)
+            spk_f32_16k    = i16_bytes_to_f32_16k(spk_bytes,    16000) if spk_bytes    else np.zeros(0, np.float32)
+
+            def dur(x): return f"{(x.size/16000.0):.2f}s" if x is not None else "0.00s"
+            self._log_ui(f"Tbuf dur: MRG={dur(merged_f32_16k)} MIC={dur(mic_f32_16k)} SPK={dur(spk_f32_16k)}")
+
             try:
-                ch = max(1, getattr(self, "channels", 1))
-                try:
-                    stereo = np.frombuffer(audio_data, np.int16).reshape(-1, ch)
-                except ValueError:
-                    self._log_ui("Transcribe skip: bytes not aligned to channel width.")
-                    return
-                if stereo.size == 0:
-                    self._log_ui("Transcribe skip: no samples after reshape.")
-                    return
+                # Prefer true per-source transcription when available
+                if mic_f32_16k.size >= 1600 and spk_f32_16k.size >= 1600:
+                    self._log_ui("Transcribe route: per-source MIC+SPK")
+                    t0 = time.perf_counter()
+                    mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
+                    spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=False)
+                    lines = interleave_tagged_segments(mic_segs, spk_segs)
+                    dt = (time.perf_counter() - t0) * 1000.0
+                    self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
+                    if not lines and merged_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: MERGED MIC+SPK")
+                        t0 = time.perf_counter()
+                        m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
+                        lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
+                else:
+                    # Single-source fallbacks with explicit tags
+                    if mic_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: MIC only")
+                        t0 = time.perf_counter()
+                        mic_segs, _ = self.model.transcribe(mic_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
+                        lines = [f"[MIC] {seg.text.strip()}" for seg in mic_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
+                    elif spk_f32_16k.size >= 1600:
+                        self._log_ui("Transcribe route: SPK only")
+                        t0 = time.perf_counter()
+                        spk_segs, _ = self.model.transcribe(spk_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
+                        lines = [f"[SPK] {seg.text.strip()}" for seg in spk_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
+                    else:
+                        if merged_f32_16k.size < 1600:
+                            self._log_ui("Transcribe skip: insufficient audio.")
+                            return
+                        self._log_ui("Transcribe route: MERGED Buffer")
+                        t0 = time.perf_counter()
+                        m_segs, _ = self.model.transcribe(merged_f32_16k, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                        dt = (time.perf_counter() - t0) * 1000.0
+                        lines = [seg.text.strip() for seg in m_segs if getattr(seg, "text", "").strip()]
+                        self._log_ui(f"Transcribe done in {dt:.0f} ms; lines={len(lines) if 'lines' in locals() else 0}")
 
-                mono = stereo.mean(axis=1).astype(np.float32) / 32768.0
-                if mono.size < 1600:
-                    self._log_ui(f"Transcribe skip: only {mono.size} samples; need more audio.")
-                    return
-                sr = int(getattr(self, "sample_rate", 16000))
-                resampled = resample_to_16k(mono, sr)
+                if lines:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    # Keep your hint-based prefix for untagged merged lines
+                    label = ""
+                    try:
+                        for hint in reversed(list(self.transcription_hints)[-5:]):
+                            if hint in ("[MIC]", "[SPK]"):
+                                label = hint + " "
+                                break
+                    except Exception:
+                        pass
 
-                # faster-whisper accepts raw float32 @ 16k
-                segments, info = self.model.transcribe(
-                    resampled,
-                    language="en",
-                    beam_size=1,
-                    vad_filter=False,
-                    without_timestamps=True,
-                )
-                text_parts = [seg.text.strip() for seg in segments if getattr(seg, "text", None)]
-                text = " ".join(text_parts).strip()
+                    for tline in lines:
+                        prefix = "" if tline.startswith("[MIC]") or tline.startswith("[SPK]") else label
+                        self._write_audio_line(f"[{ts}] {prefix}{tline}")
 
-                if text:
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    self._write_audio_line(f"[{timestamp}] {text}")
-                    QtCore.QMetaObject.invokeMethod(
-                        self.copy_button, "setEnabled", Qt.QueuedConnection, QtCore.Q_ARG(bool, True)
-                    )
-                    self.transcription_hints.append(text)
             except Exception:
                 logging.getLogger("transcriber").exception("Transcription Error")
             finally:
                 self.transcription_counter += 1
 
-    def transcribe_file(self, file_path):
-        """Use faster-whisper on whole files (audio or video)."""
+
+    # ----------------- Misc (unchanged-ish) -----------------
+    def _log_ui(self, msg: str):
         try:
-            if self.model is None:
-                self._log_ui("Model not ready yet; cannot transcribe file.")
-                return
-            segments, info = self.model.transcribe(
-                file_path, language="en", beam_size=1, vad_filter=True, without_timestamps=False
-            )
-            for seg in segments:
-                if getattr(seg, "text", ""):
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    self._write_audio_line(f"[{ts}] {seg.text.strip()}")
-            self.copy_button.setEnabled(bool(self.transcript_lines))
+            self.ui_log.emit(msg)  # thread-safe; queued to _relay_log on GUI thread
         except Exception:
-            logging.getLogger("transcriber").exception("File Transcription Error")
+            logging.getLogger("transcriber").info(msg, extra={"from_ui": True})
 
-    def change_audio_device(self, combo_index):
-        if combo_index == -1 or not self.device_map:
-            return
-        new_device = self.device_map.get(combo_index)
-        if new_device == "FILE_INPUT":
-            QtCore.QTimer.singleShot(0, self._switch_to_file_input_queued)
-            return
-        if not self.device_switch_lock.acquire(blocking=False):
-            return
-        self.suspend_transcription.set()
-        self.device_combo.setEnabled(False)
-        try:
-            self.status_label.setText("Status: Switching device...")
-            QtCore.QCoreApplication.processEvents()
-            with self.buffer_lock:
-                has_buffer = len(self.buffer) > 0
-            if has_buffer and not self.transcription_in_progress.is_set():
-                with self.transcription_lock:
-                    self.transcribe_buffer()
-            with self.opening_lock:
-                with self.stream_lock:
-                    if self.stream:
-                        try:
-                            self.stream.stop_stream(); self.stream.close()
-                        except Exception:
-                            log.exception("Error closing stream.")
-                        finally:
-                            self.stream = None
-            self.stop_event.set()
-            if self.audio_thread is not None and self.audio_thread.is_alive():
-                self.audio_thread.join(timeout=5)
-            self.audio_thread = None
-            with self.buffer_lock:
-                self.buffer.clear()
-            if self.debug:
-                self.audio_frames.clear()
-            if new_device is None:
-                self.status_label.setText("Status: No device selected.")
-                self.device_combo.setEnabled(True)
-                return
-            self.device_index = new_device
-            ok = self.open_stream()
-            if not ok:
-                self.status_label.setText("Status: Could not open selected device.")
-                self.device_combo.setEnabled(True)
-                return
 
-            self.begin_recording_if_ready()
+    def _write_audio_line(self, line: str):
+        self.transcript_lines.append(line)
+        QtCore.QMetaObject.invokeMethod(
+            self.transcript_box, "appendPlainText",
+            Qt.QueuedConnection, QtCore.Q_ARG(str, line)
+        )
 
-            self.stop_event.clear()
-            self.audio_thread = Thread(target=self.audio_loop, name="AudioLoop", daemon=True)
-            self.audio_thread.start()
-            self.status_label.setText(f"Status: Using device {self.device_combo.currentText()}")
-            QtCore.QCoreApplication.processEvents()
-        except Exception:
-            log.exception("Audio Device Change Error")
-            self.status_label.setText("Status: Error switching device")
-        finally:
-            self.suspend_transcription.clear()
-            self.device_combo.setEnabled(True)
-            try: self.device_switch_lock.release()
-            except Exception: pass
+    def get_audio_time(self) -> float | None:
+        # we write merged @16k mono; compute time from samples_written
+        if self.recording:
+            t = float(self.samples_written) / 16000.0
+            if t < self._audio_time_last:
+                t = self._audio_time_last
+            self._audio_time_last = t
+            return t
+        return None
 
-    def _switch_to_file_input_queued(self):
-        self.suspend_transcription.set()
-        self.device_combo.setEnabled(False)
-        try:
-            self.status_label.setText("Status: Loading file...")
-            QtCore.QCoreApplication.processEvents()
-            options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
-            file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Select Audio/Video File", "",
-                "Media Files (*.mp3 *.wav *.mp4 *.m4a *.flac *.aac *.ogg *.webm *.mkv);;All Files (*)",
-                options=options
-            )
-            if file_path:
-                self._log_ui(f"Audio: transcribing file '{os.path.basename(file_path)}'.")
-                self.transcribe_file(file_path)
-            else:
-                self.status_label.setText("Status: File load canceled.")
-                self._log_ui("Audio: file selection canceled.")
-        except Exception:
-            log.exception("Switch to file input failed.")
-            self.status_label.setText("Status: Error switching to file.")
-        finally:
-            self.suspend_transcription.clear()
-            self.device_combo.setEnabled(True)
-
-    # Drag-drop
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        file_path = urls[0].toLocalFile()
-        log.info(f"Dropped file: {file_path}")
-        if file_path.lower().endswith(('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.aac', '.ogg', '.webm', '.mkv')):
-            with self.opening_lock:
-                with self.stream_lock:
-                    if self.stream:
-                        try:
-                            self.stream.stop_stream(); self.stream.close()
-                        except Exception:
-                            pass
-                        self.stream = None
-            self.stop_event.set()
-            if self.audio_thread is not None and self.audio_thread.is_alive():
-                self.audio_thread.join(timeout=5)
-            self.audio_thread = None
-            self._log_ui(f"Audio: transcribing dropped file '{os.path.basename(file_path)}'.")
-            self.transcribe_file(file_path)
-        else:
-            self.status_label.setText("Status: Unsupported file type.")
-
-    # Copy (Audio + OCR)
     def copy_transcript(self):
         audio_text = '\n'.join(self.transcript_lines) if self.transcript_lines else ""
         try:
@@ -1708,37 +1900,93 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         except Exception:
             log.exception("Failed to copy combined transcripts to clipboard.")
 
+    def _switch_to_file_input(self):
+        self.suspend_transcription.set()
+        try:
+            self.status_label.setText("Status: Loading file...")
+            QtCore.QCoreApplication.processEvents()
+            options = QtWidgets.QFileDialog.Options()
+            options |= QtWidgets.QFileDialog.DontUseNativeDialog
+            file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select Audio/Video File", "",
+                "Media Files (*.mp3 *.wav *.mp4 *.m4a *.flac *.aac *.ogg *.webm *.mkv);;All Files (*)",
+                options=options
+            )
+            if file_path:
+                self._log_ui(f"Audio: transcribing file '{os.path.basename(file_path)}'.")
+                self.transcribe_file(file_path)
+            else:
+                self.status_label.setText("Status: File load canceled.")
+                self._log_ui("Audio: file selection canceled.")
+        except Exception:
+            log.exception("Switch to file input failed.")
+            self.status_label.setText("Status: Error switching to file.")
+        finally:
+            self.suspend_transcription.clear()
+
+    def transcribe_file(self, file_path):
+        """Use faster-whisper on whole files (audio or video)."""
+        try:
+            if self.model is None:
+                self._log_ui("Model not ready yet; cannot transcribe file.")
+                return
+            segments, info = self.model.transcribe(
+                file_path, language="en", beam_size=1, vad_filter=True, without_timestamps=False
+            )
+            for seg in segments:
+                if getattr(seg, "text", ""):
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    self._write_audio_line(f"[{ts}] {seg.text.strip()}")
+            self.copy_button.setEnabled(bool(self.transcript_lines))
+        except Exception:
+            logging.getLogger("transcriber").exception("File Transcription Error")
+
+    def stop_recording_if_active(self):
+        if not self.recording:
+            return
+        try:
+            if self.wav_writer:
+                self.wav_writer.close()
+        except Exception:
+            pass
+        self.wav_writer = None
+        self.recording = False
+        self.ui_log.emit(f"Audio: recording stopped ({self.recording_path})")
+        if self.recording_path and self.audio_start_epoch is not None:
+            self.recording_stopped.emit(self.recording_path, self.audio_start_epoch)
+
     def shutdown(self):
         try:
-            # Stop new work immediately
             self.suspend_transcription.set()
             self.stop_event.set()
-
-            # Stop timers
             try:
                 if hasattr(self, "force_timer") and self.force_timer:
                     self.force_timer.stop()
             except Exception:
                 logging.getLogger("transcriber").exception("Audio force_timer stop failed")
 
-            # Close stream quickly
+            try:
+                if hasattr(self, "_mute_watch_stop"):
+                    self._mute_watch_stop.set()
+            except Exception:
+                pass
+
+            # Close streams
             try:
                 with self.opening_lock:
                     with self.stream_lock:
-                        if self.stream:
-                            try:
-                                self.stream.stop_stream()
-                            except Exception:
-                                pass
-                            try:
-                                self.stream.close()
-                            except Exception:
-                                pass
-                            self.stream = None
+                        for s in (self.stream_mic, self.stream_spk):
+                            if s:
+                                try: s.stop_stream()
+                                except Exception: pass
+                                try: s.close()
+                                except Exception: pass
+                        self.stream_mic = None
+                        self.stream_spk = None
             except Exception:
                 logging.getLogger("transcriber").exception("Audio stream close failed")
 
-            # Don’t wait on long transcriptions; give it a tiny window to clear
+            # Briefly wait transcription
             try:
                 if self.transcription_in_progress.is_set():
                     waited = 0.0
@@ -1747,24 +1995,28 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             except Exception:
                 pass
 
-            # Join audio thread briefly. Never block shutdown.
+            # Join audio thread
             try:
+                self.stop_event.set()
                 t = self.audio_thread
                 if t and t.is_alive():
-                    t.join(timeout=0.5)
-                    if t.is_alive():
-                        logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
+                    deadline = time.time() + 1.0
+                    while t.is_alive() and time.time() < deadline:
+                        QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+                        time.sleep(0.01)
+                # (don’t worry if it’s still alive; we’ll replace it shortly)
+                logging.getLogger("transcriber").warning("Audio thread still alive; continuing shutdown.")
             except Exception:
                 logging.getLogger("transcriber").exception("Audio thread join failed")
 
-            # Terminate PyAudio last
+            # Terminate PyAudio
             try:
                 if hasattr(self, "pa") and self.pa:
                     self.pa.terminate()
             except Exception:
                 logging.getLogger("transcriber").exception("PyAudio terminate failed")
 
-            # Ensure WAV is closed
+            # Ensure WAV closed
             try:
                 if self.wav_writer:
                     self.wav_writer.close()
@@ -1786,15 +2038,18 @@ class MainWindow(QtWidgets.QMainWindow):
         def __init__(self, fn):
             super().__init__()
             self._fn = fn
-            self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            # You can keep a formatter for file/console; we won't use it here.
+
         def emit(self, record):
+            # Ignore mirrored UI lines
             if getattr(record, "from_ui", False):
                 return
             try:
-                self._fn(self.format(record))
+                # Pass only the raw message to the UI, and mark the origin
+                self._fn(record.getMessage(), from_logger=True)
             except Exception:
                 pass
-
+                
     def __init__(self, whisper_model):
         super().__init__()
         self._closing = False
@@ -1836,6 +2091,8 @@ class MainWindow(QtWidgets.QMainWindow):
             log_fn=self._append_log,
             get_ocr_transcript_fn=self._get_ocr_transcript_text
         )
+        
+        self.audio_tab.parent_window = self 
 
         # Loading banner (text updated)
         self.loading_banner = self._build_loading_banner()
@@ -1868,7 +2125,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ui_handler.setLevel(logging.INFO)
         logging.getLogger("transcriber").addHandler(ui_handler)
         logging.getLogger("transcriber").setLevel(logging.INFO)
-        logging.getLogger("transcriber").propagate = True  # make sure exceptions go to file too
+        logging.getLogger("transcriber").propagate = False  # make sure exceptions go to file too
 
 
         self.ocr_tab.frame_captured.connect(self._on_frame_captured)
@@ -1890,12 +2147,21 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             logging.getLogger("transcriber").exception("Error finalizing model load.")
 
+    def flush_pending_transcription(self):
+        """Force a last transcription pass if there’s buffered audio."""
+        try:
+            self.audio_tab.check_force_transcription()
+            # Give the background thread a moment if it was just scheduled
+            time.sleep(0.2)
+        except Exception:
+            logging.getLogger("transcriber").exception("MainWindow.flush_pending_transcription failed")
+
     def _build_loading_banner(self):
         bar = QtWidgets.QFrame()
         bar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         layout = QtWidgets.QHBoxLayout(bar); layout.setContentsMargins(12, 6, 12, 6)
         icon = QtWidgets.QLabel("⏳")
-        lbl  = QtWidgets.QLabel("Loading speech model in the background… Transcription will start once ready.")
+        lbl  = QtWidgets.QLabel("Speech model is initializing…")
         pbar = QtWidgets.QProgressBar(); pbar.setRange(0, 0)
         pbar.setFixedHeight(10)
         layout.addWidget(icon); layout.addWidget(lbl, 1); layout.addWidget(pbar, 0)
@@ -1935,7 +2201,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.last_audio_path = str(TEMP_WAV)
 
             try:
-                self.audio_tab.flush_pending_transcription()
+                self.flush_pending_transcription()
             except Exception:
                 logging.getLogger("transcriber").exception("force: flush failed")
 
@@ -1976,17 +2242,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_copy_all.clicked.connect(self._copy_all_logs)
         self.btn_clear_log.clicked.connect(self.log_edit.clear)
 
-    def _append_log(self, line: str):
-        # Always show in the UI
-        QtCore.QMetaObject.invokeMethod(
-            self.log_edit,
-            "appendPlainText",
-            Qt.QueuedConnection,
-            QtCore.Q_ARG(str, line)
-        )
-        # NEW: also persist to the file logger without re-injecting into the UI.
-        logging.getLogger("transcriber").info(line, extra={"from_ui": True})
 
+    def _append_log(self, line: str, from_logger: bool = False):
+        if not hasattr(self, "log_edit") or self.log_edit is None:
+            return
+        # only filter noisy lines when not in debug
+        try:
+            if not DEBUG_MODE:
+                if ("Transcribe scheduled" in line) or ("buf=" in line):
+                    return
+        except Exception:
+            pass
+
+        QtCore.QMetaObject.invokeMethod(
+            self.log_edit, "appendPlainText",
+            Qt.QueuedConnection, QtCore.Q_ARG(str, line)
+        )
+
+        
     def _copy_all_logs(self):
         txt = self.log_edit.toPlainText()
         QtWidgets.QApplication.clipboard().setText(txt)
@@ -2060,6 +2333,11 @@ class MainWindow(QtWidgets.QMainWindow):
             n_frames = len(self.session_frames)
             self._append_log(f"[export] frames={n_frames} wav={wav_path!s}")
 
+            if n_frames:
+                t0 = self.session_frames[0][1]
+                t1 = self.session_frames[-1][1]
+                self._append_log(f"[export] frame time span: {t0:.3f}s → {t1:.3f}s (Δ={(t1 - t0):.3f}s)")
+
             def wav_ok(p: str | Path, min_bytes: int = 1024) -> bool:
                 try:
                     pp = Path(p) if p else None
@@ -2081,6 +2359,10 @@ class MainWindow(QtWidgets.QMainWindow):
             have_wav = wav_ok(wav_path)
             usable_frames = has_usable_frames()
 
+            if not _ffmpeg_exists():
+                self._append_log("[export] ffmpeg missing; cannot export MP4/MP3.")
+                return
+                
             if not usable_frames and not have_wav:
                 self._append_log("[export] Nothing to export (no frames and no wav).")
                 return
@@ -2119,7 +2401,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._append_log(f"[export] {e}")
             try:
-                QMessageBox.warning(self, "Archive Export", f"Could not export archive:\n{e}\n(Temp left in {TEMP_DIR})")
+                if not self._closing:
+                    QMessageBox.warning(self, "Archive Export", f"Could not export archive:\n{e}\n(Temp left in {TEMP_DIR})")
             except Exception:
                 pass
 
@@ -2159,6 +2442,7 @@ class MainWindow(QtWidgets.QMainWindow):
             event.accept(); return
         self._closing = True
         self._append_log("Close event triggered.")
+        self._append_log(f"[shutdown] last_audio_path={self.last_audio_path} frames={len(self.session_frames)}")
 
         try:
             # 1) Stop ongoing capture ASAP so WAV is final
@@ -2173,7 +2457,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # 2) FLUSH + EXPORT *BEFORE* tearing down PyAudio
             self._append_log("[shutdown] flushing any pending transcription…")
             try:
-                self.audio_tab.flush_pending_transcription()
+                self.flush_pending_transcription()
             except Exception:
                 logging.getLogger("transcriber").exception("Flush pending transcription failed")
 
@@ -2212,12 +2496,14 @@ class MainWindow(QtWidgets.QMainWindow):
 import atexit
 def _export_guard():
     try:
+        logging.getLogger("transcriber").info("[atexit] export guard running")
         if Path(TEMP_WAV).exists():
             run_dir = RUN_DIR
             any_final = any(run_dir.glob(f"{STAMP}_video_*.mp4")) or any(run_dir.glob(f"{STAMP}_audio_*.mp3"))
             if not any_final:
                 out_mp3 = run_dir / f"{STAMP}_audio_meeting.mp3"
                 cmd = ["ffmpeg", "-y", "-i", str(TEMP_WAV), "-c:a", "libmp3lame", "-b:a", "192k", str(out_mp3)]
+                logging.getLogger("transcriber").info(f"[atexit] creating fallback MP3: {out_mp3.name}")
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
@@ -2263,6 +2549,14 @@ if __name__ == "__main__":
 
     try:
         log.info("Starting AV + OCR application…"); safe_flush()
+        log.info(f"Python={sys.version.split()[0]} platform={sys.platform} pid={os.getpid()}")
+        try:
+            import pyaudiowpatch as _pa
+            log.info(f"PyAudioWpatch version={getattr(_pa, '__version__', 'unknown')}")
+        except Exception:
+            pass
+        log.info(f"USE_TESS={USE_TESS} APP_CACHE={APP_CACHE}")
+        log.info(f"AVOS_WHISPER_MODEL={os.getenv('AVOS_WHISPER_MODEL', '') or '(default base.en)'} AVOS_COMPUTE={os.getenv('AVOS_COMPUTE', 'int8')}")
 
         if sys.platform.startswith("win"):
             try:
@@ -2349,11 +2643,24 @@ if __name__ == "__main__":
 
             except Exception:
                 logging.getLogger("transcriber").exception("Speech model load failed (faster-whisper)")
-
+                QtCore.QMetaObject.invokeMethod(
+                    window.loading_banner, "setVisible",
+                    Qt.QueuedConnection, QtCore.Q_ARG(bool, True)
+                )
+                
         Thread(target=_load_model_bg, name="FWModelLoader", daemon=True).start()
 
         log.info(f"Run output dir: {RUN_DIR}")
         log.info(f"Temp dir: {TEMP_DIR}")
+
+
+        import threading, faulthandler
+        faulthandler.enable()
+        def ping_gui():
+            print("[Ping] GUI thread alive:", threading.current_thread().name)
+            QtCore.QTimer.singleShot(1000, ping_gui)
+        QtCore.QTimer.singleShot(1000, ping_gui)
+
 
         sys.exit(app.exec_())
 
