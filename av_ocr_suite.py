@@ -1131,8 +1131,23 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         """True if NumPy array exists and has samples."""
         return arr is not None and getattr(arr, "size", 0) > 0
 
-    def _bytes_nz(self, b: bytes) -> bool:
-        return isinstance(b, (bytes, bytearray)) and len(b) > 0
+    def _arr_nz(x) -> bool:
+        """True if NumPy array-like has any elements > 0 length."""
+        try:
+            import numpy as _np
+            if isinstance(x, _np.ndarray):
+                return x.size > 0
+        except Exception:
+            pass
+        # fallback for sequences / bytes
+        try:
+            return bool(x) and len(x) > 0
+        except Exception:
+            return False
+
+    def _bytes_nz(x) -> bool:
+        """True if bytes/bytearray non-empty."""
+        return isinstance(x, (bytes, bytearray)) and len(x) > 0
 
     # ----------------- UI -----------------
     def init_ui(self):
@@ -1189,7 +1204,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
         self.ind_mic = _make_pill("MIC: —")
         self.ind_spk = _make_pill("SPEAKER: —")
-
+        
         pill_row.addWidget(self.ind_mic, 0)
         pill_row.addSpacing(8)
         pill_row.addWidget(self.ind_spk, 0)
@@ -1688,28 +1703,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 with self.stream_lock:
                     mic_active = bool(self.stream_mic and self.stream_mic.is_active())
                     spk_active = bool(self.stream_spk and self.stream_spk.is_active())
-                '''
-                self._set_indicator(
-                    self.ind_mic,
-                    on=(mic_active and not muted),
-                    text_on="MIC: RECORDING",
-                    text_off=("MIC: MUTED" if muted else "MIC: NOT RECORDING"),
-                    color_on="#1ea672",
-                    color_off=("#d43c3c" if muted else "#666666")
-                )
-
-                # SPEAKER pill: show RECORDING (green) when speaker stream is active and we are writing it into the mix
-                # Heuristic: if spk_active AND (we produced a non-empty chunk from speaker path this loop)
-                spk_recording = spk_active and self._nz(spk_i16)  # speaker contributed to the mix we wrote
-                self._set_indicator(
-                    self.ind_spk,
-                    on=spk_recording,
-                    text_on="SPEAKER: RECORDING",
-                    text_off="SPEAKER: NOT RECORDING",
-                    color_on="#1ea672",
-                    color_off="#666666"
-                )
-                '''                
+   
                 # MIC pill
                 if muted:
                     self._set_indicator(self.ind_mic, False, "MIC: RECORDING", "MIC: MUTED",
@@ -1722,8 +1716,8 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 # either (a) we wrote audio recently or (b) buffer_spk has bytes
                 with self.buffer_lock:
                     spk_buf_bytes = sum(len(b) for b in self.buffer_spk)
-                spk_recording = spk_active and (spk_buf_bytes > 0 or bool(self.wav_writer))
-
+                #spk_recording = spk_active and (spk_buf_bytes > 0 or bool(self.wav_writer))
+                spk_recording = spk_active and (i16 and len(i16) > 0)
                 self._set_indicator(self.ind_spk, spk_recording,
                                     "SPEAKER: RECORDING", "SPEAKER: NOT RECORDING",
                                     color_on="#1ea672", color_off="#666666")
@@ -1757,22 +1751,23 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 # Build mixed chunk (speaker-only while muted)
                 mix = None
                 if muted:
-                    if self._nz(self._nz(spk_f)) is not None and self._nz(spk_f).size:
-                        mix = self.mix_spk_gain * self._nz(spk_f)
+                    if spk_f is not None and spk_f.size:
+                        mix = self.mix_spk_gain * spk_f
                 else:
-                    if mic_f is not None and self._nz(spk_f) is not None:
-                        n = min(mic_f.size, self._nz(spk_f).size)
+                    if mic_f is not None and spk_f is not None:
+                        n = min(mic_f.size, spk_f.size)
                         if n > 0:
-                            mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * self._nz(spk_f[:n]))
+                            mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
                             mix = np.clip(mix, -1.0, 1.0)
                     elif mic_f is not None:
                         mix = self.mix_mic_gain * mic_f
-                    elif self._nz(spk_f) is not None:
-                        mix = self.mix_spk_gain * self._nz(spk_f)
+                    elif spk_f is not None:
+                        mix = self.mix_spk_gain * spk_f
+
 
                 # Append to merged 16k buffer + write to WAV (speaker-only when muted)
                 i16 = b""
-                if mix is not None and getattr(mix, "size", 0) > 0:
+                if mix is not None and mix.size:
                     i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
                     with self.buffer_lock:
                         self.buffer.append(i16)
@@ -2276,6 +2271,18 @@ class MainWindow(QtWidgets.QMainWindow):
             time.sleep(0.2)
         except Exception:
             logging.getLogger("transcriber").exception("MainWindow.flush_pending_transcription failed")
+
+    # --- BIG status badges ---
+    def _set_badge(self, label: QtWidgets.QLabel, text: str, bg: str):
+        label.setText(text)
+        label.setStyleSheet(
+            "QLabel {"
+            f"background:{bg}; color:#111; font-weight:800;"
+            "border-radius:8px; padding:6px 10px; border:1px solid #0002;"
+            "}"
+        )
+
+
 
     def _build_loading_banner(self):
         bar = QtWidgets.QFrame()
