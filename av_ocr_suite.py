@@ -1082,6 +1082,25 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         
         
    
+    def _set_indicator(self, label: QtWidgets.QLabel, on: bool, text_on: str, text_off: str,
+                       color_on: str = "#1ea672", color_off: str = "#d43c3c"):
+        txt = text_on if on else text_off
+        color = color_on if on else color_off
+        # Update on GUI thread
+        QtCore.QMetaObject.invokeMethod(
+            label, "setText", Qt.QueuedConnection, QtCore.Q_ARG(str, txt)
+        )
+        QtCore.QMetaObject.invokeMethod(
+            label, "setStyleSheet", Qt.QueuedConnection,
+            QtCore.Q_ARG(str,
+                "QLabel {"
+                f" background:{color}; color:white;"
+                " font: 700 14pt 'Segoe UI';"
+                " padding: 6px 14px;"
+                " border-radius: 18px;"
+                "}"
+            )
+        )
         
     # ----------------- UI -----------------
     def init_ui(self):
@@ -1117,6 +1136,35 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.status_label)
+
+        # ===== Big state indicators =====
+        pill_row = QtWidgets.QHBoxLayout()
+
+        def _make_pill(text):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumHeight(36)
+            # Big, rounded "pill" look
+            lbl.setStyleSheet(
+                "QLabel {"
+                "  background:#666; color:white;"
+                "  font: 700 14pt 'Segoe UI';"
+                "  padding: 6px 14px;"
+                "  border-radius: 18px;"
+                "}"
+            )
+            return lbl
+
+        self.ind_mic = _make_pill("MIC: —")
+        self.ind_spk = _make_pill("SPEAKER: —")
+
+        pill_row.addWidget(self.ind_mic, 0)
+        pill_row.addSpacing(8)
+        pill_row.addWidget(self.ind_spk, 0)
+        pill_row.addStretch(1)
+
+        layout.addLayout(pill_row)
+        # =================================
 
         row1 = QtWidgets.QHBoxLayout()
         row1.addWidget(QtWidgets.QLabel("Mic →"))
@@ -1572,6 +1620,35 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
             # Current mute state
             muted = self._is_externally_muted()
+
+            # ===== Update big indicators =====
+            # MIC pill: show MUTED (red) when externally muted; otherwise RECORDING (green) iff mic stream active
+            with self.stream_lock:
+                mic_active = bool(self.stream_mic and self.stream_mic.is_active())
+                spk_active = bool(self.stream_spk and self.stream_spk.is_active())
+
+            self._set_indicator(
+                self.ind_mic,
+                on=(mic_active and not muted),
+                text_on="MIC: RECORDING",
+                text_off=("MIC: MUTED" if muted else "MIC: NOT RECORDING"),
+                color_on="#1ea672",
+                color_off=("#d43c3c" if muted else "#666666")
+            )
+
+            # SPEAKER pill: show RECORDING (green) when speaker stream is active and we are writing it into the mix
+            # Heuristic: if spk_active AND (we produced a non-empty chunk from speaker path this loop)
+            spk_recording = spk_active and (i16 and len(i16) > 0)  # speaker contributed to the mix we wrote
+            self._set_indicator(
+                self.ind_spk,
+                on=spk_recording,
+                text_on="SPEAKER: RECORDING",
+                text_off="SPEAKER: NOT RECORDING",
+                color_on="#1ea672",
+                color_off="#666666"
+            )
+            # =================================
+
 
             # Per-source byte buffers (mic suppressed while muted)
             if mic_i16 is not None and mic_i16.size and not muted:
