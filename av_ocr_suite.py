@@ -1455,7 +1455,14 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
     # ----------------- Audio loop (dual source) -----------------
     def audio_loop(self):
+        """
+        Dual-source loop:
+          - Always capture speaker/loopback.
+          - Suppress mic in buffers/WAV/transcription while externally muted.
+          - Keep draining mic device even when muted to avoid overrun.
+        """
         self._log_ui("Audio: loop entered (dual-source)")
+
         VAD_SR = 16000
         VAD_SAMPLES_30MS = int(VAD_SR * 0.03)
 
@@ -1463,9 +1470,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             try:
                 avail = stream.get_read_available()
                 if avail is None:
-                    # some hosts return None; fall back to small non-blocking chunk
                     avail = 0
-                # read if we have at least half of what we want; cap to available
                 n = min(avail, want_frames) if avail >= (want_frames // 2) else 0
                 if n > 0:
                     return stream.read(n, exception_on_overflow=False)
@@ -1488,26 +1493,32 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         def i16_to_f32(x):
             return (x.astype(np.float32) / 32768.0) if x is not None and x.size else None
 
-        def rms_db(x):
-            if x is None or not x.size:
-                return -120.0
-            r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)) + 1e-12)
-            return 20.0 * math.log10(r + 1e-20)
+        def vad_last30(xf):
+            if xf is None or xf.size < VAD_SAMPLES_30MS:
+                return False
+            y = xf[-VAD_SAMPLES_30MS:]
+            y16 = np.clip(np.round(y * 32768.0), -32768, 32767).astype(np.int16)
+            try:
+                return self.vad.is_speech(y16.tobytes(), 16000)
+            except Exception:
+                return False
 
-        # local snapshots of streams/params
+        # Snapshot streams and their params
         with self.stream_lock:
             s_m = getattr(self, "stream_mic", None)
             s_s = getattr(self, "stream_spk", None)
         m_state = dict(getattr(self, "mic_open", {}) or {})
         s_state = dict(getattr(self, "spk_open", {}) or {})
 
-        self._log_ui(f"Audio cfg: MIC sr={m_state.get('sr')} ch={m_state.get('ch')} fpb={m_state.get('fpb')}; "
-                     f"SPK sr={s_state.get('sr')} ch={s_state.get('ch')} fpb={s_state.get('fpb')}")
+        self._log_ui(
+            f"Audio cfg: MIC sr={m_state.get('sr')} ch={m_state.get('ch')} fpb={m_state.get('fpb')}; "
+            f"SPK sr={s_state.get('sr')} ch={s_state.get('ch')} fpb={s_state.get('fpb')}"
+        )
 
         m_fpb = int(m_state.get("fpb", 0) or 0)
         s_fpb = int(s_state.get("fpb", 0) or 0)
 
-        # -------------------------------------
+        # Ensure streams are started
         with self.stream_lock:
             if self.stream_mic and not self.stream_mic.is_active():
                 try:
@@ -1521,30 +1532,18 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     self.stream_spk.start_stream()
                 except Exception:
                     self._log_ui("Audio[SPK]: failed to start stream")
-            # -------------------------------------
-            sm_active = bool(self.stream_mic and self.stream_mic.is_active())
-            ss_active = bool(self.stream_spk and self.stream_spk.is_active())
-            self._log_ui(f"Audio: post-start active → MIC={sm_active} SPK={ss_active}")
-            
-            mic_block = safe_read(s_m, m_fpb) if (s_m and m_fpb > 0) else None
-            spk_block = safe_read(s_s, s_fpb) if (s_s and s_fpb > 0) else None
-       
-            try:
-                m_av = s_m.get_read_available() if s_m else None
-                s_av = s_s.get_read_available() if s_s else None
-                self._log_ui(f"Audio: initial read_available → MIC={m_av} SPK={s_av}")
-            except Exception as e:
-                self._log_ui(f"Audio: initial read_available error: {e}")
 
+        # Main loop
         while not self.stop_event.is_set():
-            # Pull a block from each *if available*
             mic_block = None
             spk_block = None
 
+            # Re-snapshot streams (they can be switched)
             with self.stream_lock:
                 s_m = getattr(self, "stream_mic", None)
                 s_s = getattr(self, "stream_spk", None)
 
+            # Non-blocking reads
             try:
                 if s_m and s_m.is_active() and m_fpb > 0:
                     mic_block = safe_read(s_m, m_fpb)
@@ -1552,7 +1551,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             except Exception as e:
                 self._log_ui(f"Audio[MIC]: read error → {type(e).__name__}: {e}")
                 mic_block = None
-
 
             try:
                 if s_s and s_s.is_active() and s_fpb > 0:
@@ -1562,19 +1560,21 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 self._log_ui(f"Audio[SPK]: read error → {type(e).__name__}: {e}")
                 spk_block = None
 
-
             # Convert to mono i16
             mic_i16 = to_mono_i16(mic_block, m_state.get("ch", 1)) if mic_block else None
             spk_i16 = to_mono_i16(spk_block, s_state.get("ch", 1)) if spk_block else None
 
-            # Resample to 16k float32 for VAD + mix
+            # Resample to 16k float32 for VAD/mix
             m_sr = int(m_state.get("sr", 16000) or 16000)
             s_sr = int(s_state.get("sr", 16000) or 16000)
             mic_f = resample_to_16k(i16_to_f32(mic_i16), m_sr) if mic_i16 is not None else None
             spk_f = resample_to_16k(i16_to_f32(spk_i16), s_sr) if spk_i16 is not None else None
 
-            # Feed per-source 16k i16 bytes into dedicated buffers (for proper tagging)
-            if mic_i16 is not None and mic_i16.size:
+            # Current mute state
+            muted = self._is_externally_muted()
+
+            # Per-source byte buffers (mic suppressed while muted)
+            if mic_i16 is not None and mic_i16.size and not muted:
                 try:
                     mic_bytes_16k = _resample_i16_for_vad(mic_i16, m_sr, 16000)
                     with self.buffer_lock:
@@ -1590,115 +1590,76 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 except Exception:
                     pass
 
-            # Log meters occasionally so we can see if mic is alive
-            now = time.time()
-            if self.debug and now - self.last_meter_log > 5.0:
-                db_m = rms_db(mic_f) if mic_f is not None else -120.0
-                db_s = rms_db(spk_f) if spk_f is not None else -120.0
-                self._log_ui(f"Meter: MIC {db_m:.1f} dBFS, SPK {db_s:.1f} dBFS "
-                             f"(tot mic {self.mic_bytes_total}B, spk {self.spk_bytes_total}B)")
-                self.last_meter_log = now
-
-
-            # Per-source VAD (use last 30ms of each if present)
-            def vad_last30(xf):
-                if xf is None: return False
-                if xf.size < VAD_SAMPLES_30MS: return False
-                y = xf[-VAD_SAMPLES_30MS:]
-                y16 = np.clip(np.round(y*32768), -32768, 32767).astype(np.int16)
-                try: return self.vad.is_speech(y16.tobytes(), 16000)
-                except: return False
-
-            now = time.time()
-            if not hasattr(self, "_last_buf_log"):
-                self._last_buf_log = 0.0
-            if now - self._last_buf_log > 5.0:
-                with self.buffer_lock:
-                    mb = sum(len(b) for b in self.buffer_mic)
-                    sb = sum(len(b) for b in self.buffer_spk)
-                    mm = sum(len(b) for b in self.buffer)
-                # 2 bytes/sample @ 16k
-                def b2ms(n): return (n / (2*16000.0)) * 1000.0
-                self._log_ui(f"Buf: MIC={mb}B ({b2ms(mb):.0f}ms) SPK={sb}B ({b2ms(sb):.0f}ms) MIX={mm}B ({b2ms(mm):.0f}ms)")
-                self._last_buf_log = now
-
-            mic_speech = vad_last30(mic_f)
+            # VAD (mic VAD disabled while muted)
+            if muted:
+                mic_speech = False
+            else:
+                mic_speech = vad_last30(mic_f)
             spk_speech = vad_last30(spk_f)
 
-#            if mic_speech or spk_speech:
-#                self._log_ui(f"VAD: mic={mic_speech} spk={spk_speech}")
-
-            muted = self._is_externally_muted()
-            QtCore.QMetaObject.invokeMethod(
-                self.status_label, "setText", Qt.QueuedConnection,
-                QtCore.Q_ARG(str, "Status: Muted (following Teams/device)" if muted else "Status: Listening…")
-            )
-
-            # Build the mixed float32 16k chunk (align lengths)
+            # Build mixed chunk (speaker-only while muted)
             mix = None
-            if mic_f is not None and spk_f is not None:
-                n = min(mic_f.size, spk_f.size)
-                if n > 0:
-                    mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
-                    # prevent clipping
-                    mix = np.clip(mix, -1.0, 1.0)
-            elif mic_f is not None:
-                mix = self.mix_mic_gain * mic_f
-            elif spk_f is not None:
-                mix = self.mix_spk_gain * spk_f
+            if muted:
+                if spk_f is not None and spk_f.size:
+                    mix = self.mix_spk_gain * spk_f
+            else:
+                if mic_f is not None and spk_f is not None:
+                    n = min(mic_f.size, spk_f.size)
+                    if n > 0:
+                        mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
+                        mix = np.clip(mix, -1.0, 1.0)
+                elif mic_f is not None:
+                    mix = self.mix_mic_gain * mic_f
+                elif spk_f is not None:
+                    mix = self.mix_spk_gain * spk_f
 
-            # Append mixed audio to the transcription buffer in raw int16 (16k)
-            i16 = b""  # <— initialize so it's always defined
+            # Append to merged 16k buffer + write to WAV (speaker-only when muted)
+            i16 = b""
             if mix is not None and mix.size:
                 i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
                 with self.buffer_lock:
                     self.buffer.append(i16)
-                    
-            # --- write to the merged WAV on disk (16k mono) ---
+
             try:
                 if self.wav_writer:
                     self.wav_writer.writeframes(i16)
-                    self.samples_written += len(i16) // 2  # int16 samples
-                    # log every ~5s of written audio
-                    if (time.time() - getattr(self, "_last_wav_log", 0)) > 5.0:
-                        self._log_ui(f"WAV: samples_written={self.samples_written} (~{self.samples_written/16000.0:.1f}s)")
-                        self._last_wav_log = time.time()
+                    self.samples_written += len(i16) // 2
             except Exception as e:
                 self._log_ui(f"WAV write error → {type(e).__name__}: {e}")
 
-            # UI + scheduling
-            # --- inside AudioTranscriberWidget.audio_loop() ---
+            # UI status
+            QtCore.QMetaObject.invokeMethod(
+                self.status_label,
+                "setText",
+                Qt.QueuedConnection,
+                QtCore.Q_ARG(str, "Status: Muted (mic paused) — capturing speakers" if muted else "Status: Listening…")
+            )
 
-            # (A) VAD activity branch
+            # Scheduling
+            now = time.time()
             if mic_speech or spk_speech:
                 self.was_speech = True
-                if ((not self._is_externally_muted()) or spk_speech):
-                    QtCore.QTimer.singleShot(0, self._try_schedule_transcription)   # was: self._try_schedule_transcription()
-                    self._log_ui("Transcribe scheduled: VAD activity")
-                else:
-                    self._log_ui("Muted externally → skip scheduling on VAD")
-                if mic_speech and self._is_externally_muted():
-                    self.transcription_hints.append("[MIC - Muted]")
-                if mic_speech and not self._is_externally_muted():
-                    self.transcription_hints.append("[MIC]")
-                if spk_speech:
-                    self.transcription_hints.append("[SPK]")
-
-            # (B) Silent branch, time-based fallback
+                # schedule if: (not muted) OR (muted and speaker speech)
+                if (not muted) or spk_speech:
+                    QtCore.QTimer.singleShot(0, self._try_schedule_transcription)
             else:
                 if self.was_speech:
                     self.was_speech = False
                     QtCore.QMetaObject.invokeMethod(
-                        self.status_label, "setText", Qt.QueuedConnection,
-                        QtCore.Q_ARG(str, "Status: Silent")
+                        self.status_label, "setText", Qt.QueuedConnection, QtCore.Q_ARG(str, "Status: Silent")
                     )
+
+                # Force transcription if buffer has content:
+                #  - not muted: any merged audio
+                #  - muted: speaker-only buffer
                 if (now - self.last_transcription_time) > self.force_transcription_interval:
                     with self.buffer_lock:
-                        have_any = len(self.buffer) > 0
-                    if have_any and not self._is_externally_muted():
+                        have_merge = len(self.buffer) > 0
+                        have_spk = len(self.buffer_spk) > 0
+                    if (not muted and have_merge) or (muted and have_spk):
                         QtCore.QTimer.singleShot(0, self._try_schedule_transcription)
-                        self._log_ui("Transcribe scheduled: Force due to duration of audio")
 
+            # Small sleep keeps CPU sane
             time.sleep(0.002)
 
     # ----------------- Transcription -----------------
