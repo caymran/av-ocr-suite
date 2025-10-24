@@ -1698,32 +1698,6 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 # Current mute state
                 muted = self._is_externally_muted()
 
-                # ===== Update big indicators =====
-                # MIC pill: show MUTED (red) when externally muted; otherwise RECORDING (green) iff mic stream active
-                with self.stream_lock:
-                    mic_active = bool(self.stream_mic and self.stream_mic.is_active())
-                    spk_active = bool(self.stream_spk and self.stream_spk.is_active())
-   
-                # MIC pill
-                if muted:
-                    self._set_indicator(self.ind_mic, False, "MIC: RECORDING", "MIC: MUTED",
-                                        color_on="#1ea672", color_off="#d43c3c")
-                else:
-                    self._set_indicator(self.ind_mic, mic_active, "MIC: RECORDING", "MIC: NOT RECORDING",
-                                        color_on="#1ea672", color_off="#666666")
-
-                # SPEAKER pill: turn green if the loopback stream is active AND
-                # either (a) we wrote audio recently or (b) buffer_spk has bytes
-                with self.buffer_lock:
-                    spk_buf_bytes = sum(len(b) for b in self.buffer_spk)
-                #spk_recording = spk_active and (spk_buf_bytes > 0 or bool(self.wav_writer))
-                spk_recording = spk_active and (i16 and len(i16) > 0)
-                self._set_indicator(self.ind_spk, spk_recording,
-                                    "SPEAKER: RECORDING", "SPEAKER: NOT RECORDING",
-                                    color_on="#1ea672", color_off="#666666")
-                # =================================
-
-
                 # Per-source byte buffers (mic suppressed while muted)
                 if mic_i16 is not None and mic_i16.size and not muted:
                     try:
@@ -1778,6 +1752,36 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                         self.samples_written += len(i16) // 2
                 except Exception as e:
                     self._log_ui(f"WAV write error → {type(e).__name__}: {e}")
+
+
+                # ===== Update big indicators (AFTER mix/i16 is produced) =====
+                with self.stream_lock:
+                    mic_active = bool(self.stream_mic and self.stream_mic.is_active())
+                    spk_active = bool(self.stream_spk and self.stream_spk.is_active())
+
+                # Compute how “active” the speaker path is:
+                with self.buffer_lock:
+                    spk_buf_bytes = sum(len(b) for b in self.buffer_spk)
+
+                # MIC pill
+                if muted:
+                    self._set_indicator(self.ind_mic, False,
+                                        "MIC: RECORDING", "MIC: MUTED",
+                                        color_on="#1ea672", color_off="#d43c3c")
+                else:
+                    self._set_indicator(self.ind_mic, mic_active,
+                                        "MIC: RECORDING", "MIC: NOT RECORDING",
+                                        color_on="#1ea672", color_off="#666666")
+
+                # SPEAKER pill: turn green if loopback stream is alive AND we have either
+                # (a) a non-empty i16 mixed chunk this loop, or (b) spk buffer has bytes
+                spk_recording = spk_active and ((len(i16) > 0) or (spk_buf_bytes > 0))
+                self._set_indicator(self.ind_spk, spk_recording,
+                                    "SPEAKER: RECORDING", "SPEAKER: NOT RECORDING",
+                                    color_on="#1ea672", color_off="#666666")
+                # =================================
+
+
 
                 # UI status
                 QtCore.QMetaObject.invokeMethod(
