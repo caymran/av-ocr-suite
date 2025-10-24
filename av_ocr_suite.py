@@ -1126,6 +1126,14 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
             )
         )
         
+    # Small helpers to avoid NumPy truthiness crashes
+    def _nz(self, arr) -> bool:
+        """True if NumPy array exists and has samples."""
+        return arr is not None and getattr(arr, "size", 0) > 0
+
+    def _bytes_nz(self, b: bytes) -> bool:
+        return isinstance(b, (bytes, bytearray)) and len(b) > 0
+
     # ----------------- UI -----------------
     def init_ui(self):
         self.status_label = QtWidgets.QLabel("Status: Silent")
@@ -1222,15 +1230,40 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
         except Exception:
             logging.getLogger("transcriber").exception("UI log relay failed")
 
+    def read_device_mute_by_name(substring: str) -> bool:
+        try:
+            import comtypes, comtypes.client
+            mmde = comtypes.client.CreateObject(CLSID_MMDeviceEnumerator,
+                                                interface=comtypes.gen.MMDeviceApiLib.IMMDeviceEnumerator)
+            coll = mmde.EnumAudioEndpoints(eCapture, 1)  # DEVICE_STATE_ACTIVE = 1
+            count = coll.GetCount()
+            for i in range(count):
+                dev = coll.Item(i)
+                # FriendlyName
+                props = dev.OpenPropertyStore(0)  # STGM_READ
+                from comtypes.gen import Propsys
+                from comtypes.gen import _886D8EEB_8CF2_4446_8D02_CDBA1DBDCF99_0_1_0 as PKeys
+                PKEY_Device_FriendlyName = PKeys.PROPERTYKEY(fmtid=GUID('{A45C254E-DF1C-4EFD-8020-67D146A850E0}'), pid=14)
+                name = (props.GetValue(PKEY_Device_FriendlyName).GetValue() or "")
+                if substring.lower() in name.lower():
+                    epv = dev.Activate(IID_IAudioEndpointVolume, comtypes.CLSCTX_ALL, None,
+                                       interface=comtypes.gen.AudioEndpointVolumeLib.IAudioEndpointVolume)
+                    return bool(epv.GetMute())
+        except Exception:
+            pass
+        # fallback
+        return read_device_mute_now()
+
+
     def _is_externally_muted(self) -> bool:
-        # Prefer the selected mic’s endpoint mute if we can match by name
         mic = self._current_combo_data(self.mic_combo)
         name_hint = (mic or {}).get("label", "")
-        # strip the " [Mic]" suffix if present
-        name_hint = name_hint.split(" [", 1)[0].strip() if name_hint else ""
+        # strip suffix like " [Mic]"
+        if " [" in name_hint:
+            name_hint = name_hint.split(" [", 1)[0].strip()
         device_muted = read_device_mute_by_name(name_hint) if name_hint else read_device_mute_now()
-        # Also respect Teams UI state if available
         return device_muted or self.muted_teams.is_set()
+
 
     def _prefer_index(self, items, *needles):
         """
@@ -1655,7 +1688,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 with self.stream_lock:
                     mic_active = bool(self.stream_mic and self.stream_mic.is_active())
                     spk_active = bool(self.stream_spk and self.stream_spk.is_active())
-
+'''
                 self._set_indicator(
                     self.ind_mic,
                     on=(mic_active and not muted),
@@ -1667,7 +1700,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
 
                 # SPEAKER pill: show RECORDING (green) when speaker stream is active and we are writing it into the mix
                 # Heuristic: if spk_active AND (we produced a non-empty chunk from speaker path this loop)
-                spk_recording = spk_active and (spk_i16 and len(spk_i16) > 0)  # speaker contributed to the mix we wrote
+                spk_recording = spk_active and self._nz(spk_i16)  # speaker contributed to the mix we wrote
                 self._set_indicator(
                     self.ind_spk,
                     on=spk_recording,
@@ -1676,6 +1709,24 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     color_on="#1ea672",
                     color_off="#666666"
                 )
+'''                
+                # MIC pill
+                if muted:
+                    self._set_indicator(self.ind_mic, False, "MIC: RECORDING", "MIC: MUTED",
+                                        color_on="#1ea672", color_off="#d43c3c")
+                else:
+                    self._set_indicator(self.ind_mic, mic_active, "MIC: RECORDING", "MIC: NOT RECORDING",
+                                        color_on="#1ea672", color_off="#666666")
+
+                # SPEAKER pill: turn green if the loopback stream is active AND
+                # either (a) we wrote audio recently or (b) buffer_spk has bytes
+                with self.buffer_lock:
+                    spk_buf_bytes = sum(len(b) for b in self.buffer_spk)
+                spk_recording = spk_active and (spk_buf_bytes > 0 or bool(self.wav_writer))
+
+                self._set_indicator(self.ind_spk, spk_recording,
+                                    "SPEAKER: RECORDING", "SPEAKER: NOT RECORDING",
+                                    color_on="#1ea672", color_off="#666666")
                 # =================================
 
 
@@ -1706,22 +1757,22 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 # Build mixed chunk (speaker-only while muted)
                 mix = None
                 if muted:
-                    if spk_f is not None and spk_f.size:
-                        mix = self.mix_spk_gain * spk_f
+                    if self._nz(self._nz(spk_f)) is not None and self._nz(spk_f).size:
+                        mix = self.mix_spk_gain * self._nz(spk_f)
                 else:
-                    if mic_f is not None and spk_f is not None:
-                        n = min(mic_f.size, spk_f.size)
+                    if mic_f is not None and self._nz(spk_f) is not None:
+                        n = min(mic_f.size, self._nz(spk_f).size)
                         if n > 0:
-                            mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * spk_f[:n])
+                            mix = (self.mix_mic_gain * mic_f[:n]) + (self.mix_spk_gain * self._nz(spk_f[:n]))
                             mix = np.clip(mix, -1.0, 1.0)
                     elif mic_f is not None:
                         mix = self.mix_mic_gain * mic_f
-                    elif spk_f is not None:
-                        mix = self.mix_spk_gain * spk_f
+                    elif self._nz(spk_f) is not None:
+                        mix = self.mix_spk_gain * self._nz(spk_f)
 
                 # Append to merged 16k buffer + write to WAV (speaker-only when muted)
                 i16 = b""
-                if mix is not None and mix.size:
+                if mix is not None and getattr(mix, "size", 0) > 0:
                     i16 = np.clip(np.round(mix * 32768.0), -32768, 32767).astype(np.int16).tobytes()
                     with self.buffer_lock:
                         self.buffer.append(i16)
