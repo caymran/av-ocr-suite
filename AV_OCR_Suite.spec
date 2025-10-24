@@ -99,11 +99,6 @@ hiddenimports = [
     'asyncio',
     'asyncio.windows_events',
     'asyncio.windows_utils',
-
-	#comtypes for mute detection
-	'comtypes', 
-	'comtypes.client', 
-	'comtypes.gen',
 ]
 
 # ---------- Runtime hooks ----------
@@ -175,4 +170,5 @@ coll = COLLECT(
     upx_exclude=[],
     name='AV_OCR_Suite',
 )
+
 
