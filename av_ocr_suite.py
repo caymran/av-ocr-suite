@@ -1688,7 +1688,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                 with self.stream_lock:
                     mic_active = bool(self.stream_mic and self.stream_mic.is_active())
                     spk_active = bool(self.stream_spk and self.stream_spk.is_active())
-'''
+                '''
                 self._set_indicator(
                     self.ind_mic,
                     on=(mic_active and not muted),
@@ -1709,7 +1709,7 @@ class AudioTranscriberWidget(QtWidgets.QWidget):
                     color_on="#1ea672",
                     color_off="#666666"
                 )
-'''                
+                '''                
                 # MIC pill
                 if muted:
                     self._set_indicator(self.ind_mic, False, "MIC: RECORDING", "MIC: MUTED",
